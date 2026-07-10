@@ -1,0 +1,253 @@
+2026-07-10 15:09:15  INFO      features.app_logger                  Logging initialised — log dir: /media/ashok-innoppl/7CD60970D6092C48/algo-backend/shared/logs
+2026-07-10 15:09:36  INFO      simulator_main                       [simulator_main] algo.websocket /health ok — starting CentralTickClient
+2026-07-10 15:09:36  INFO      features.central_tick_client         [CentralTick] started → ws://localhost:8003/ws/internal-ticks
+2026-07-10 15:09:36  INFO      simulator_main                       [simulator_main] CentralTickClient started — broker WS owned by algo.websocket
+2026-07-10 15:09:36  INFO      features.central_tick_client         [CentralTick] connected to ws://localhost:8003/ws/internal-ticks
+2026-07-10 15:09:51  INFO      features.app_logger                  Logging initialised — log dir: /media/ashok-innoppl/7CD60970D6092C48/algo-backend/shared/logs
+2026-07-10 15:09:52  INFO      algo_main                            [algo_main] algo.websocket /health ok — starting CentralTickClient
+2026-07-10 15:09:52  INFO      features.central_tick_client         [CentralTick] started → ws://localhost:8003/ws/internal-ticks
+2026-07-10 15:09:52  INFO      algo_main                            [algo_main] CentralTickClient started — broker WS owned by algo.websocket
+2026-07-10 15:09:52  INFO      features.central_tick_client         [CentralTick] connected to ws://localhost:8003/ws/internal-ticks
+2026-07-10 15:09:55  INFO      features.span_file                   SPAN params loaded from DB: 6 underlyings
+2026-07-10 15:09:55  INFO      features.span_file                   SPAN defaults seeded to DB: 6 records
+2026-07-10 15:09:55  INFO      features.span_file                   SPAN params loaded from DB: 6 underlyings
+2026-07-10 15:09:59  INFO      features.span_file                   BSE SPAN loaded from BSERISK20260522-00.XML: 219 underlyings
+2026-07-10 15:10:18  INFO      features.execution_socket            [BROKER SETTINGS EMIT] user=6a3917c7e0e323bfd2a398e7 brokers=0 delivered=1
+2026-07-10 15:10:29  ERROR     db_activity                          [DB QUERY ERROR] method=replSetGetStatus collection=1 query_ms=2.42 db=admin target=local error={'ok':_0.0,_'errmsg':_'not_running_with_--replSet',_'code':_76,_'codeName':_'NoReplicationEnabled'}
+2026-07-10 15:10:29  INFO      features.db_change_watcher           [DB WATCHER] polling mode (no replica set), trade_date=2026-07-10
+2026-07-10 15:10:29  INFO      features.central_tick_client         [CentralTick] subscribed 1 tokens via hub
+2026-07-10 15:10:29  INFO      features.central_tick_client         [CentralTick] subscribed 1 tokens via hub
+2026-07-10 15:10:29  INFO      features.central_tick_client         [CentralTick] subscribed 1 tokens via hub
+2026-07-10 15:10:29  INFO      features.central_tick_client         [CentralTick] warmed 378 chain tokens via hub
+2026-07-10 15:10:29  INFO      features.central_tick_client         [CentralTick] subscribed 375 tokens via hub
+2026-07-10 15:10:29  INFO      features.telegram_notifier           [TELEGRAM common:admin] [ltp_fetch_error] | 375 token(s) have no LTP after REST fallback and no cached last-good price | tokens=836689,836809,836194,836672,836726,836847,836568,836705,836764,836226
+2026-07-10 15:10:29  WARNING   features.telegram_notifier           [TELEGRAM] skipped — bot token or admin chat_id not configured for category "common"
+2026-07-10 15:10:31  INFO      db_activity                          [DB WRITE]  col=algo_trades  op=close_leg  id=exec_19f4a61c4f2de7b6e0fc359  leg_id=k49do8lv  exit_reason=exit_time  exit_price=577.0999755859375  ts=2026-07-10T15:10:29
+2026-07-10 15:10:31  INFO      db_activity                          [DB WRITE]  col=algo_trades  op=close_leg  id=exec_19f4a60c46c99426e0fc359  leg_id=ttx2772l  exit_reason=exit_time  exit_price=413.3999938964844  ts=2026-07-10T15:10:29
+2026-07-10 15:10:31  INFO      db_activity                          [DB WRITE]  col=algo_trades  op=close_leg  id=exec_19f4a60c46c99426e0fc359  leg_id=ttx2772l  exit_reason=exit_time  exit_price=414.04998779296875  ts=2026-07-10T15:10:29
+2026-07-10 15:10:31  INFO      db_activity                          [DB WRITE]  col=algo_trades  op=close_leg  id=exec_19f4a61c4f2de7b6e0fc359  leg_id=ttx2772l  exit_reason=exit_time  exit_price=414.04998779296875  ts=2026-07-10T15:10:29
+2026-07-10 15:10:31  INFO      db_activity                          [DB WRITE]  col=algo_trades  op=close_leg  id=exec_19f4a60c46c99426e0fc359  leg_id=k49do8lv  exit_reason=exit_time  exit_price=576.2000122070312  ts=2026-07-10T15:10:29
+2026-07-10 15:10:31  INFO      db_activity                          [DB WRITE]  col=algo_trades  op=squared_off_exit_time  id=exec_19f4a61c4f2de7b6e0fc359
+2026-07-10 15:10:31  INFO      db_activity                          [DB WRITE]  col=algo_trades  op=close_leg  id=exec_19f4a60c46c99426e0fc359  leg_id=k49do8lv  exit_reason=exit_time  exit_price=576.2000122070312  ts=2026-07-10T15:10:29
+2026-07-10 15:10:31  INFO      db_activity                          [DB WRITE]  col=algo_trades  op=squared_off_exit_time  id=exec_19f4a60c46c99426e0fc359
+2026-07-10 15:10:47  INFO      features.db_change_watcher           [DB WATCHER] stopped
+2026-07-10 15:10:47  INFO      features.db_change_watcher           [DB WATCHER] stopped
+2026-07-10 15:10:50  INFO      api                                  Dhan consent generated user_id=1103877976 consent=9b3e6a9d-2481-488a-b77f-72fa5463d5cc
+2026-07-10 15:11:43  INFO      api                                  Dhan access token saved client_id=1103877976 expiry=2026-07-11T15:11:42
+2026-07-10 15:11:44  INFO      features.central_tick_client         [CentralTick] started → ws://localhost:8003/ws/internal-ticks
+2026-07-10 15:11:44  INFO      features.db_change_watcher           [DB WATCHER] polling mode (no replica set), trade_date=2026-07-10
+2026-07-10 15:11:44  INFO      features.central_tick_client         [CentralTick] connected to ws://localhost:8003/ws/internal-ticks
+2026-07-10 15:11:52  INFO      features.db_change_watcher           [DB WATCHER] stopped
+2026-07-10 15:11:52  INFO      features.db_change_watcher           [DB WATCHER] stopped
+2026-07-10 15:11:53  INFO      features.central_tick_client         [CentralTick] started → ws://localhost:8003/ws/internal-ticks
+2026-07-10 15:11:53  INFO      features.db_change_watcher           [DB WATCHER] polling mode (no replica set), trade_date=2026-07-10
+2026-07-10 15:11:53  INFO      features.central_tick_client         [CentralTick] connected to ws://localhost:8003/ws/internal-ticks
+2026-07-10 15:12:01  INFO      features.central_tick_client         [CentralTick] subscribed 3 tokens via hub
+2026-07-10 15:12:08  INFO      features.central_tick_client         [CentralTick] subscribed 3 tokens via hub
+2026-07-10 15:12:08  INFO      features.telegram_notifier           [TELEGRAM common:admin] [ltp_fetch_error] | 3 token(s) have no LTP after REST fallback and no cached last-good price | tokens=51380,51366,51367
+2026-07-10 15:12:08  WARNING   features.telegram_notifier           [TELEGRAM] skipped — bot token or admin chat_id not configured for category "common"
+2026-07-10 15:12:09  INFO      features.central_tick_client         [CentralTick] subscribed 3 tokens via hub
+2026-07-10 15:12:09  INFO      features.central_tick_client         [CentralTick] subscribed 2 tokens via hub
+2026-07-10 15:12:09  INFO      features.telegram_notifier           [TELEGRAM common:admin] [ltp_fetch_error] | 2 token(s) have no LTP after REST fallback and no cached last-good price | tokens=822419,822315
+2026-07-10 15:12:09  WARNING   features.telegram_notifier           [TELEGRAM] skipped — bot token or admin chat_id not configured for category "common"
+2026-07-10 15:12:09  INFO      features.central_tick_client         [CentralTick] subscribed 3 tokens via hub
+2026-07-10 15:12:10  INFO      features.central_tick_client         [CentralTick] subscribed 2 tokens via hub
+2026-07-10 15:12:10  INFO      features.telegram_notifier           [TELEGRAM common:admin] [ltp_fetch_error] | 2 token(s) have no LTP after REST fallback and no cached last-good price | tokens=822301,821980
+2026-07-10 15:12:10  WARNING   features.telegram_notifier           [TELEGRAM] skipped — bot token or admin chat_id not configured for category "common"
+2026-07-10 15:12:10  INFO      features.central_tick_client         [CentralTick] subscribed 2 tokens via hub
+2026-07-10 15:12:11  INFO      features.central_tick_client         [CentralTick] subscribed 2 tokens via hub
+2026-07-10 15:12:12  INFO      features.central_tick_client         [CentralTick] subscribed 2 tokens via hub
+2026-07-10 15:12:57  INFO      features.execution_socket            [BROKER SETTINGS EMIT] user=6a3917c7e0e323bfd2a398e7 brokers=0 delivered=1
+2026-07-10 15:18:00  INFO      features.telegram_notifier           [TELEGRAM common:admin] [ltp_fetch_error] | 375 token(s) have no LTP after REST fallback and no cached last-good price | tokens=836689,836809,836194,836672,836726,836847,836568,836705,836764,836226
+2026-07-10 15:18:00  WARNING   features.telegram_notifier           [TELEGRAM] skipped — bot token or admin chat_id not configured for category "common"
+2026-07-10 15:18:01  INFO      db_activity                          [DB WRITE]  col=algo_trades  op=close_leg  id=exec_19f4a60c46c99428848f2dc  leg_id=k49do8lv  exit_reason=exit_time  exit_price=662.8499755859375  ts=2026-07-10T15:18:00
+2026-07-10 15:18:01  INFO      db_activity                          [DB WRITE]  col=algo_trades  op=close_leg  id=exec_19f4a60c46c99428848f2dc  leg_id=ttx2772l  exit_reason=exit_time  exit_price=435.3999938964844  ts=2026-07-10T15:18:00
+2026-07-10 15:18:01  INFO      db_activity                          [DB WRITE]  col=algo_trades  op=squared_off_exit_time  id=exec_19f4a60c46c99428848f2dc
+2026-07-10 15:19:15  INFO      features.telegram_notifier           [TELEGRAM common:admin] [ltp_fetch_error] | 153 token(s) have no LTP after REST fallback and no cached last-good price | tokens=836689,836809,836194,836672,836726,836847,836568,836764,836487,836314
+2026-07-10 15:19:15  WARNING   features.telegram_notifier           [TELEGRAM] skipped — bot token or admin chat_id not configured for category "common"
+2026-07-10 15:19:16  INFO      db_activity                          [DB WRITE]  col=algo_trades  op=close_leg  id=exec_19f4a61c4f2de7b6e0fc35a  leg_id=k49do8lv  exit_reason=exit_time  exit_price=537.9500122070312  ts=2026-07-10T15:19:15
+2026-07-10 15:19:16  INFO      db_activity                          [DB WRITE]  col=algo_trades  op=close_leg  id=exec_19f4a61c4f2de7b6e0fc35a  leg_id=ttx2772l  exit_reason=exit_time  exit_price=438.1000061035156  ts=2026-07-10T15:19:15
+2026-07-10 15:19:16  INFO      db_activity                          [DB WRITE]  col=algo_trades  op=squared_off_exit_time  id=exec_19f4a61c4f2de7b6e0fc35a
+2026-07-10 15:19:16  INFO      db_activity                          [DB WRITE]  col=algo_trades  op=close_leg  id=exec_19f4a61c4f2de7b8848f2dc  leg_id=k49do8lv  exit_reason=exit_time  exit_price=660.6500244140625  ts=2026-07-10T15:19:15
+2026-07-10 15:19:16  INFO      db_activity                          [DB WRITE]  col=algo_trades  op=close_leg  id=exec_19f4a61c4f2de7b8848f2dc  leg_id=ttx2772l  exit_reason=exit_time  exit_price=438.1000061035156  ts=2026-07-10T15:19:15
+2026-07-10 15:19:16  INFO      db_activity                          [DB WRITE]  col=algo_trades  op=squared_off_exit_time  id=exec_19f4a61c4f2de7b8848f2dc
+2026-07-10 15:19:16  INFO      db_activity                          [DB WRITE]  col=algo_trades  op=close_leg  id=exec_19f4a62c43c8c208848f2de  leg_id=k49do8lv  exit_reason=exit_time  exit_price=660.6500244140625  ts=2026-07-10T15:19:15
+2026-07-10 15:19:16  INFO      db_activity                          [DB WRITE]  col=algo_trades  op=close_leg  id=exec_19f4a62c43c8c208848f2de  leg_id=ttx2772l  exit_reason=exit_time  exit_price=438.1000061035156  ts=2026-07-10T15:19:15
+2026-07-10 15:19:16  INFO      db_activity                          [DB WRITE]  col=algo_trades  op=squared_off_exit_time  id=exec_19f4a62c43c8c208848f2de
+2026-07-10 15:22:25  WARNING   features.central_tick_client         [CentralTick] WS error: received 1012 (service restart); then sent 1012 (service restart) — retry in 2s
+2026-07-10 15:22:25  WARNING   features.central_tick_client         [CentralTick] WS error: received 1012 (service restart); then sent 1012 (service restart) — retry in 2s
+2026-07-10 15:22:38  WARNING   features.central_tick_client         [CentralTick] WS error:  — retry in 2s
+2026-07-10 15:22:39  INFO      features.app_logger                  Logging initialised — log dir: /media/ashok-innoppl/7CD60970D6092C48/algo-backend/shared/logs
+2026-07-10 15:22:40  INFO      simulator_main                       [simulator_main] algo.websocket /health ok — starting CentralTickClient
+2026-07-10 15:22:40  INFO      features.central_tick_client         [CentralTick] started → ws://localhost:8003/ws/internal-ticks
+2026-07-10 15:22:40  INFO      simulator_main                       [simulator_main] CentralTickClient started — broker WS owned by algo.websocket
+2026-07-10 15:22:40  INFO      features.central_tick_client         [CentralTick] connected to ws://localhost:8003/ws/internal-ticks
+2026-07-10 15:22:40  INFO      features.central_tick_client         [CentralTick] connected to ws://localhost:8003/ws/internal-ticks
+2026-07-10 15:22:51  INFO      features.app_logger                  Logging initialised — log dir: /media/ashok-innoppl/7CD60970D6092C48/algo-backend/shared/logs
+2026-07-10 15:22:52  INFO      algo_main                            [algo_main] algo.websocket /health ok — starting CentralTickClient
+2026-07-10 15:22:52  INFO      features.central_tick_client         [CentralTick] started → ws://localhost:8003/ws/internal-ticks
+2026-07-10 15:22:52  INFO      algo_main                            [algo_main] CentralTickClient started — broker WS owned by algo.websocket
+2026-07-10 15:22:52  INFO      features.central_tick_client         [CentralTick] connected to ws://localhost:8003/ws/internal-ticks
+2026-07-10 15:22:54  INFO      features.central_tick_client         [CentralTick] subscribed 3 tokens via hub
+2026-07-10 15:22:55  INFO      features.span_file                   SPAN params loaded from DB: 6 underlyings
+2026-07-10 15:22:55  INFO      features.span_file                   SPAN defaults seeded to DB: 6 records
+2026-07-10 15:22:55  INFO      features.span_file                   SPAN params loaded from DB: 6 underlyings
+2026-07-10 15:23:00  INFO      features.span_file                   BSE SPAN loaded from BSERISK20260522-00.XML: 219 underlyings
+2026-07-10 15:23:56  ERROR     db_activity                          [DB QUERY ERROR] method=replSetGetStatus collection=1 query_ms=0.48 db=admin target=local error={'ok':_0.0,_'errmsg':_'not_running_with_--replSet',_'code':_76,_'codeName':_'NoReplicationEnabled'}
+2026-07-10 15:23:56  INFO      features.db_change_watcher           [DB WATCHER] polling mode (no replica set), trade_date=2026-07-10
+2026-07-10 15:24:24  INFO      features.central_tick_client         [CentralTick] subscribed 3 tokens via hub
+2026-07-10 15:24:24  INFO      features.telegram_notifier           [TELEGRAM common:admin] [ltp_fetch_error] | 3 token(s) have no LTP after REST fallback and no cached last-good price | tokens=51380,51367,51366
+2026-07-10 15:24:24  WARNING   features.telegram_notifier           [TELEGRAM] skipped — bot token or admin chat_id not configured for category "common"
+2026-07-10 15:24:24  INFO      features.central_tick_client         [CentralTick] subscribed 3 tokens via hub
+2026-07-10 15:24:25  INFO      features.central_tick_client         [CentralTick] subscribed 2 tokens via hub
+2026-07-10 15:24:25  INFO      features.telegram_notifier           [TELEGRAM common:admin] [ltp_fetch_error] | 2 token(s) have no LTP after REST fallback and no cached last-good price | tokens=822419,822315
+2026-07-10 15:24:25  WARNING   features.telegram_notifier           [TELEGRAM] skipped — bot token or admin chat_id not configured for category "common"
+2026-07-10 15:24:25  INFO      features.central_tick_client         [CentralTick] subscribed 3 tokens via hub
+2026-07-10 15:24:25  INFO      features.central_tick_client         [CentralTick] subscribed 2 tokens via hub
+2026-07-10 15:24:25  INFO      features.telegram_notifier           [TELEGRAM common:admin] [ltp_fetch_error] | 2 token(s) have no LTP after REST fallback and no cached last-good price | tokens=822301,821980
+2026-07-10 15:24:25  WARNING   features.telegram_notifier           [TELEGRAM] skipped — bot token or admin chat_id not configured for category "common"
+2026-07-10 15:24:25  INFO      features.central_tick_client         [CentralTick] subscribed 2 tokens via hub
+2026-07-10 15:24:26  INFO      features.central_tick_client         [CentralTick] subscribed 2 tokens via hub
+2026-07-10 15:24:26  INFO      features.central_tick_client         [CentralTick] subscribed 2 tokens via hub
+2026-07-10 15:50:55  WARNING   features.broker_gateway              [BROKER REST QUOTES] HTTPSConnectionPool(host='api.dhan.co', port=443): Max retries exceeded with url: /v2/marketfeed/quote (Caused by NameResolutionError("<urllib3.connection.HTTPSConnection object at 0x7355aa6b75b0>: Failed to resolve 'api.dhan.co' ([Errno -3] Temporary failure in name resolution)"))
+2026-07-10 15:50:55  INFO      features.telegram_notifier           [TELEGRAM common:admin] [ltp_fetch_error] | get_broker_rest_quotes Dhan REST call failed: HTTPSConnectionPool(host='api.dhan.co', port=443): Max retries exceeded with url: /v2/marketfeed/quote (Caused by NameResolutionError("<urllib3.connection.HTTPSConnection object at 0x7355aa6b75b0>: Failed to resolve 'api.dhan.co' ([Errno -3] Temporary failure in name resolution)"))
+2026-07-10 15:50:55  WARNING   features.telegram_notifier           [TELEGRAM] skipped — bot token or admin chat_id not configured for category "common"
+2026-07-10 15:50:55  INFO      features.telegram_notifier           [TELEGRAM common:admin] [ltp_fetch_error] | 3 token(s) have no LTP after REST fallback and no cached last-good price | tokens=51380,51367,51366
+2026-07-10 15:50:55  WARNING   features.telegram_notifier           [TELEGRAM] skipped — bot token or admin chat_id not configured for category "common"
+2026-07-10 15:50:56  INFO      features.telegram_notifier           [TELEGRAM common:admin] [ltp_fetch_error] | 2 token(s) have no LTP after REST fallback and no cached last-good price | tokens=822419,822315
+2026-07-10 15:50:56  WARNING   features.telegram_notifier           [TELEGRAM] skipped — bot token or admin chat_id not configured for category "common"
+2026-07-10 15:50:56  WARNING   features.broker_gateway              [BROKER REST QUOTES] HTTPSConnectionPool(host='api.dhan.co', port=443): Max retries exceeded with url: /v2/marketfeed/quote (Caused by NameResolutionError("<urllib3.connection.HTTPSConnection object at 0x7355d9448940>: Failed to resolve 'api.dhan.co' ([Errno -3] Temporary failure in name resolution)"))
+2026-07-10 15:50:56  INFO      features.telegram_notifier           [TELEGRAM common:admin] [ltp_fetch_error] | get_broker_rest_quotes Dhan REST call failed: HTTPSConnectionPool(host='api.dhan.co', port=443): Max retries exceeded with url: /v2/marketfeed/quote (Caused by NameResolutionError("<urllib3.connection.HTTPSConnection object at 0x7355d9448940>: Failed to resolve 'api.dhan.co' ([Errno -3] Temporary failure in name resolution)"))
+2026-07-10 15:50:56  WARNING   features.telegram_notifier           [TELEGRAM] skipped — bot token or admin chat_id not configured for category "common"
+2026-07-10 15:50:56  INFO      features.telegram_notifier           [TELEGRAM common:admin] [ltp_fetch_error] | 2 token(s) have no LTP after REST fallback and no cached last-good price | tokens=822301,821980
+2026-07-10 15:50:56  WARNING   features.telegram_notifier           [TELEGRAM] skipped — bot token or admin chat_id not configured for category "common"
+2026-07-10 15:50:57  WARNING   features.broker_gateway              [BROKER REST QUOTES] HTTPSConnectionPool(host='api.dhan.co', port=443): Max retries exceeded with url: /v2/marketfeed/quote (Caused by NameResolutionError("<urllib3.connection.HTTPSConnection object at 0x7355aa6b6bc0>: Failed to resolve 'api.dhan.co' ([Errno -3] Temporary failure in name resolution)"))
+2026-07-10 15:50:57  INFO      features.telegram_notifier           [TELEGRAM common:admin] [ltp_fetch_error] | get_broker_rest_quotes Dhan REST call failed: HTTPSConnectionPool(host='api.dhan.co', port=443): Max retries exceeded with url: /v2/marketfeed/quote (Caused by NameResolutionError("<urllib3.connection.HTTPSConnection object at 0x7355aa6b6bc0>: Failed to resolve 'api.dhan.co' ([Errno -3] Temporary failure in name resolution)"))
+2026-07-10 15:50:57  WARNING   features.telegram_notifier           [TELEGRAM] skipped — bot token or admin chat_id not configured for category "common"
+2026-07-10 15:51:06  ERROR     features.telegram_notifier           [TELEGRAM linking] poll iteration failed
+Traceback (most recent call last):
+  File "/home/ashok-innoppl/.local/lib/python3.10/site-packages/urllib3/connectionpool.py", line 534, in _make_request
+    response = conn.getresponse()
+  File "/home/ashok-innoppl/.local/lib/python3.10/site-packages/urllib3/connection.py", line 565, in getresponse
+    httplib_response = super().getresponse()
+  File "/usr/lib/python3.10/http/client.py", line 1404, in getresponse
+    response.begin()
+  File "/usr/lib/python3.10/http/client.py", line 323, in begin
+    version, status, reason = self._read_status()
+  File "/usr/lib/python3.10/http/client.py", line 284, in _read_status
+    line = str(self.fp.readline(_MAXLINE + 1), "iso-8859-1")
+  File "/usr/lib/python3.10/socket.py", line 705, in readinto
+    return self._sock.recv_into(b)
+  File "/usr/lib/python3.10/ssl.py", line 1303, in recv_into
+    return self.read(nbytes, buffer)
+  File "/usr/lib/python3.10/ssl.py", line 1159, in read
+    return self._sslobj.read(len, buffer)
+TimeoutError: The read operation timed out
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "/home/ashok-innoppl/.local/lib/python3.10/site-packages/requests/adapters.py", line 486, in send
+    resp = conn.urlopen(
+  File "/home/ashok-innoppl/.local/lib/python3.10/site-packages/urllib3/connectionpool.py", line 841, in urlopen
+    retries = retries.increment(
+  File "/home/ashok-innoppl/.local/lib/python3.10/site-packages/urllib3/util/retry.py", line 474, in increment
+    raise reraise(type(error), error, _stacktrace)
+  File "/home/ashok-innoppl/.local/lib/python3.10/site-packages/urllib3/util/util.py", line 39, in reraise
+    raise value
+  File "/home/ashok-innoppl/.local/lib/python3.10/site-packages/urllib3/connectionpool.py", line 787, in urlopen
+    response = self._make_request(
+  File "/home/ashok-innoppl/.local/lib/python3.10/site-packages/urllib3/connectionpool.py", line 536, in _make_request
+    self._raise_timeout(err=e, url=url, timeout_value=read_timeout)
+  File "/home/ashok-innoppl/.local/lib/python3.10/site-packages/urllib3/connectionpool.py", line 367, in _raise_timeout
+    raise ReadTimeoutError(
+urllib3.exceptions.ReadTimeoutError: HTTPSConnectionPool(host='api.telegram.org', port=443): Read timed out. (read timeout=35)
+
+During handling of the above exception, another exception occurred:
+
+Traceback (most recent call last):
+  File "/media/ashok-innoppl/7CD60970D6092C48/algo-backend/algo.trade/features/telegram_notifier.py", line 363, in telegram_linking_poll_loop
+    resp = await asyncio.to_thread(
+  File "/usr/lib/python3.10/asyncio/threads.py", line 25, in to_thread
+    return await loop.run_in_executor(None, func_call)
+  File "/usr/lib/python3.10/concurrent/futures/thread.py", line 58, in run
+    result = self.fn(*self.args, **self.kwargs)
+  File "/home/ashok-innoppl/.local/lib/python3.10/site-packages/requests/api.py", line 73, in get
+    return request("get", url, params=params, **kwargs)
+  File "/home/ashok-innoppl/.local/lib/python3.10/site-packages/requests/api.py", line 59, in request
+    return session.request(method=method, url=url, **kwargs)
+  File "/home/ashok-innoppl/.local/lib/python3.10/site-packages/requests/sessions.py", line 589, in request
+    resp = self.send(prep, **send_kwargs)
+  File "/home/ashok-innoppl/.local/lib/python3.10/site-packages/requests/sessions.py", line 703, in send
+    r = adapter.send(request, **kwargs)
+  File "/home/ashok-innoppl/.local/lib/python3.10/site-packages/requests/adapters.py", line 532, in send
+    raise ReadTimeout(e, request=request)
+requests.exceptions.ReadTimeout: HTTPSConnectionPool(host='api.telegram.org', port=443): Read timed out. (read timeout=35)
+2026-07-10 15:51:11  ERROR     features.telegram_notifier           [TELEGRAM linking] poll iteration failed
+Traceback (most recent call last):
+  File "/home/ashok-innoppl/.local/lib/python3.10/site-packages/urllib3/connection.py", line 198, in _new_conn
+    sock = connection.create_connection(
+  File "/home/ashok-innoppl/.local/lib/python3.10/site-packages/urllib3/util/connection.py", line 60, in create_connection
+    for res in socket.getaddrinfo(host, port, family, socket.SOCK_STREAM):
+  File "/usr/lib/python3.10/socket.py", line 955, in getaddrinfo
+    for res in _socket.getaddrinfo(host, port, family, type, proto, flags):
+socket.gaierror: [Errno -3] Temporary failure in name resolution
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "/home/ashok-innoppl/.local/lib/python3.10/site-packages/urllib3/connectionpool.py", line 787, in urlopen
+    response = self._make_request(
+  File "/home/ashok-innoppl/.local/lib/python3.10/site-packages/urllib3/connectionpool.py", line 488, in _make_request
+    raise new_e
+  File "/home/ashok-innoppl/.local/lib/python3.10/site-packages/urllib3/connectionpool.py", line 464, in _make_request
+    self._validate_conn(conn)
+  File "/home/ashok-innoppl/.local/lib/python3.10/site-packages/urllib3/connectionpool.py", line 1093, in _validate_conn
+    conn.connect()
+  File "/home/ashok-innoppl/.local/lib/python3.10/site-packages/urllib3/connection.py", line 753, in connect
+    self.sock = sock = self._new_conn()
+  File "/home/ashok-innoppl/.local/lib/python3.10/site-packages/urllib3/connection.py", line 205, in _new_conn
+    raise NameResolutionError(self.host, self, e) from e
+urllib3.exceptions.NameResolutionError: <urllib3.connection.HTTPSConnection object at 0x7cd5ef369810>: Failed to resolve 'api.telegram.org' ([Errno -3] Temporary failure in name resolution)
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "/home/ashok-innoppl/.local/lib/python3.10/site-packages/requests/adapters.py", line 486, in send
+    resp = conn.urlopen(
+  File "/home/ashok-innoppl/.local/lib/python3.10/site-packages/urllib3/connectionpool.py", line 841, in urlopen
+    retries = retries.increment(
+  File "/home/ashok-innoppl/.local/lib/python3.10/site-packages/urllib3/util/retry.py", line 519, in increment
+    raise MaxRetryError(_pool, url, reason) from reason  # type: ignore[arg-type]
+urllib3.exceptions.MaxRetryError: HTTPSConnectionPool(host='api.telegram.org', port=443): Max retries exceeded with url: /bot8910385114:AAEeOZnJXTW4PxA5eFx-kZQabZA9kpjnXI8/getUpdates?offset=87833331&timeout=25&allowed_updates=%5B%22message%22%5D (Caused by NameResolutionError("<urllib3.connection.HTTPSConnection object at 0x7cd5ef369810>: Failed to resolve 'api.telegram.org' ([Errno -3] Temporary failure in name resolution)"))
+
+During handling of the above exception, another exception occurred:
+
+Traceback (most recent call last):
+  File "/media/ashok-innoppl/7CD60970D6092C48/algo-backend/algo.trade/features/telegram_notifier.py", line 363, in telegram_linking_poll_loop
+    resp = await asyncio.to_thread(
+  File "/usr/lib/python3.10/asyncio/threads.py", line 25, in to_thread
+    return await loop.run_in_executor(None, func_call)
+  File "/usr/lib/python3.10/concurrent/futures/thread.py", line 58, in run
+    result = self.fn(*self.args, **self.kwargs)
+  File "/home/ashok-innoppl/.local/lib/python3.10/site-packages/requests/api.py", line 73, in get
+    return request("get", url, params=params, **kwargs)
+  File "/home/ashok-innoppl/.local/lib/python3.10/site-packages/requests/api.py", line 59, in request
+    return session.request(method=method, url=url, **kwargs)
+  File "/home/ashok-innoppl/.local/lib/python3.10/site-packages/requests/sessions.py", line 589, in request
+    resp = self.send(prep, **send_kwargs)
+  File "/home/ashok-innoppl/.local/lib/python3.10/site-packages/requests/sessions.py", line 703, in send
+    r = adapter.send(request, **kwargs)
+  File "/home/ashok-innoppl/.local/lib/python3.10/site-packages/requests/adapters.py", line 519, in send
+    raise ConnectionError(e, request=request)
+requests.exceptions.ConnectionError: HTTPSConnectionPool(host='api.telegram.org', port=443): Max retries exceeded with url: /bot8910385114:AAEeOZnJXTW4PxA5eFx-kZQabZA9kpjnXI8/getUpdates?offset=87833331&timeout=25&allowed_updates=%5B%22message%22%5D (Caused by NameResolutionError("<urllib3.connection.HTTPSConnection object at 0x7cd5ef369810>: Failed to resolve 'api.telegram.org' ([Errno -3] Temporary failure in name resolution)"))
+2026-07-10 15:55:57  WARNING   features.central_tick_client         [CentralTick] WS error: received 1012 (service restart); then sent 1012 (service restart) — retry in 2s
+2026-07-10 15:55:57  WARNING   features.central_tick_client         [CentralTick] WS error: received 1012 (service restart); then sent 1012 (service restart) — retry in 2s
+2026-07-10 15:55:59  WARNING   features.central_tick_client         [CentralTick] WS error: [Errno 111] Connection refused — retry in 2s
+2026-07-10 15:55:59  WARNING   features.central_tick_client         [CentralTick] WS error: [Errno 111] Connection refused — retry in 2s
+2026-07-10 15:56:01  WARNING   features.central_tick_client         [CentralTick] WS error: [Errno 111] Connection refused — retry in 2s
+2026-07-10 15:56:01  WARNING   features.central_tick_client         [CentralTick] WS error: [Errno 111] Connection refused — retry in 2s
+2026-07-10 15:56:03  WARNING   features.central_tick_client         [CentralTick] WS error: [Errno 111] Connection refused — retry in 2s
+2026-07-10 15:56:05  WARNING   features.central_tick_client         [CentralTick] WS error: [Errno 111] Connection refused — retry in 2s
+2026-07-10 15:56:07  WARNING   features.central_tick_client         [CentralTick] WS error: [Errno 111] Connection refused — retry in 2s
+2026-07-10 15:56:09  WARNING   features.central_tick_client         [CentralTick] WS error: [Errno 111] Connection refused — retry in 2s

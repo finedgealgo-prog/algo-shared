@@ -34,6 +34,21 @@ from typing import Any, Optional
 import bcrypt
 import jwt
 from fastapi import HTTPException, Header
+from pydantic import BaseModel
+
+
+class RegisterIn(BaseModel):
+    mobile: str
+    name: str
+    email: str
+    password: str
+    referral_code: Optional[str] = None
+
+
+class LoginIn(BaseModel):
+    mobile: str
+    password: str
+
 
 JWT_SECRET_KEY    = os.getenv("JWT_SECRET_KEY", "")
 JWT_ALGORITHM      = "HS256"
