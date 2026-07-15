@@ -59,10 +59,18 @@ from features.chart_data import (
     get_symbol_historical_chart_bars,
     search_symbol_universe,
 )
+from features.mongo_data import MONGO_URI
 
 router = APIRouter(prefix="/v1")
 
-_mongo_client      = MongoClient("mongodb://localhost:27017/")
+# Was hardcoded to "mongodb://localhost:27017/", bypassing MONGO_URI (the
+# shared toggle every other module routes through) — harmless in local dev
+# where Mongo really is on localhost, but on a server where Mongo lives on
+# its own box, every chart-state/alerts read here hit a 20s connect timeout
+# against nothing listening on localhost:27017, then silently fell back to
+# an empty/localStorage state. Same bug class as the algo.simulator/simulator/
+# files fixed earlier — this file just hadn't been checked yet.
+_mongo_client      = MongoClient(MONGO_URI)
 _stock_db          = _mongo_client["stock_data"]
 _tv_chart_state_col = _stock_db["tv_chart_state"]
 _tv_alerts_col      = _stock_db["tv_alerts"]
@@ -163,13 +171,18 @@ async def get_chart_state(
 ) -> dict:
     """Layout + resolution only — each alert is its own document in
     tv_alerts (see GET /alerts), not nested in this doc anymore."""
+    import time as _t  # TEMPORARY DIAGNOSTIC — remove with the prints below
+    _t0 = _t.perf_counter()
+    print(f"[TIMING chart-state] ENTER (auth already resolved by Depends) t=0.000s")
     try:
         user_id = _get_required_user_id(current_user)
+        print(f"[TIMING chart-state] got user_id={user_id} t={_t.perf_counter()-_t0:.3f}s")
         doc = _tv_chart_state_col.find_one(
             {"user_id": user_id, "page_id": page_id, "symbol": symbol},
             {"_id": 0, "layout": 1, "resolution": 1, "updated_at": 1, "page_id": 1, "symbol": 1},
         )
-        return {
+        print(f"[TIMING chart-state] find_one done, doc={'found' if doc else 'none'} t={_t.perf_counter()-_t0:.3f}s")
+        result = {
             "status": "success",
             "state": doc
             or {
@@ -180,9 +193,13 @@ async def get_chart_state(
                 "updated_at": None,
             },
         }
+        print(f"[TIMING chart-state] EXIT success t={_t.perf_counter()-_t0:.3f}s")
+        return result
     except HTTPException:
+        print(f"[TIMING chart-state] EXIT HTTPException t={_t.perf_counter()-_t0:.3f}s")
         raise
     except Exception as exc:
+        print(f"[TIMING chart-state] EXIT Exception={exc} t={_t.perf_counter()-_t0:.3f}s")
         return {"status": "error", "message": str(exc)}
 
 
@@ -225,9 +242,14 @@ async def list_chart_alerts(
 ) -> dict:
     """Every alert is its own tv_alerts document — one new record per
     alert created, never a shared array field rewritten on every save."""
+    import time as _t  # TEMPORARY DIAGNOSTIC — remove with the prints below
+    _t0 = _t.perf_counter()
+    print(f"[TIMING alerts] ENTER (auth already resolved by Depends) t=0.000s")
     try:
         user_id = _get_required_user_id(current_user)
+        print(f"[TIMING alerts] got user_id={user_id} t={_t.perf_counter()-_t0:.3f}s")
         docs = list(_tv_alerts_col.find({"user_id": user_id, "page_id": page_id, "symbol": symbol}, {"_id": 0}))
+        print(f"[TIMING alerts] find() done, {len(docs)} docs t={_t.perf_counter()-_t0:.3f}s")
         # Defensive: alerts saved before the _resolve_webhook_scope fix above
         # may still have a raw ObjectId sitting in webhook_owner_id — pydantic
         # can't serialize that, so stringify it here rather than 500ing on
@@ -236,10 +258,13 @@ async def list_chart_alerts(
             owner_id = doc.get("webhook_owner_id")
             if isinstance(owner_id, ObjectId):
                 doc["webhook_owner_id"] = str(owner_id)
+        print(f"[TIMING alerts] EXIT success t={_t.perf_counter()-_t0:.3f}s")
         return {"status": "success", "alerts": docs}
     except HTTPException:
+        print(f"[TIMING alerts] EXIT HTTPException t={_t.perf_counter()-_t0:.3f}s")
         raise
     except Exception as exc:
+        print(f"[TIMING alerts] EXIT Exception={exc} t={_t.perf_counter()-_t0:.3f}s")
         return {"status": "error", "message": str(exc)}
 
 

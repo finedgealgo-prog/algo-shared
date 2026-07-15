@@ -19,6 +19,7 @@ import asyncio
 import json
 import logging
 import re
+import threading
 from datetime import datetime, timedelta, timezone
 from time import perf_counter
 from typing import Any
@@ -96,6 +97,11 @@ LIVE_TICK_SECONDS = 60          # check interval for live mode
 ENABLE_BACKTEST_DEBUG_LOGS = False
 OPTION_CHAIN_COLLECTION = 'option_chain_historical_data'
 SLOW_BACKTEST_WARN_MS = 250
+# How long (real wall-clock seconds) a 'processing' pending_entry/momentum_pending
+# claim in algo_leg_feature_status is honored before another concurrent caller
+# (fast-forward step API vs broker-tick worker) is allowed to reclaim it. Must be
+# generous enough to cover a full chain-fetch + pricing cycle for one leg.
+PROCESSING_CLAIM_STALE_SECONDS = 60
 DATE_RE = re.compile(r'^\d{4}-\d{2}-\d{2}$')
 LISTENING_STRATEGY_SNAPSHOTS: dict[str, list[dict[str, Any]]] = {}
 LISTENING_TIME_STATE: dict[str, dict[str, Any]] = {}
@@ -1621,6 +1627,29 @@ def push_new_leg_in_db(db: MongoData, trade_id: str, new_leg: dict) -> None:
     except Exception as exc:
         log.error('push_new_leg_in_db error: %s', exc)
     mark_execute_order_dirty_from_trade_id(db, trade_id)
+
+
+# Live/fast-forward strategies are driven by two independent tick sources
+# (the websocket autorun loop in update_socket() and the on-demand
+# run_backtest_simulation_step() used for fast-forward stepping). Both can
+# call _queue_original_legs_if_needed() for the same trade around the same
+# simulated tick. _queue_pending_entry_feature_status() below does a
+# find_one-then-insert_one check for an existing pending_entry doc, which is
+# NOT atomic — two threads can both pass the find_one before either inserts,
+# producing two pending_entry docs (and therefore two duplicate entered legs)
+# for the same parent leg config. This per-(trade_id, leg_id) lock closes
+# that race by serializing the check-and-insert.
+_pending_entry_queue_locks: dict[str, threading.Lock] = {}
+_pending_entry_queue_locks_guard = threading.Lock()
+
+
+def _get_pending_entry_queue_lock(key: str) -> threading.Lock:
+    with _pending_entry_queue_locks_guard:
+        lock = _pending_entry_queue_locks.get(key)
+        if lock is None:
+            lock = threading.Lock()
+            _pending_entry_queue_locks[key] = lock
+        return lock
 
 
 def _is_strict_history_leg_mode(activation_mode: str | None = None) -> bool:
@@ -3174,24 +3203,30 @@ def _queue_pending_entry_feature_status(
         'updated_at': now_ts,
     }
     try:
-        # Filter must include triggered/processing — if feature was already entered
-        # (status='triggered'), we must NOT insert a new 'active' feature.
-        # Using only status='active' caused duplicate entries: after first entry the
-        # feature becomes 'triggered', upsert misses it, inserts a new 'active' doc.
-        existing = feature_col.find_one(
-            {
-                'trade_id': trade_id,
-                'leg_id': normalized_leg_id,
-                'feature': 'pending_entry',
-                'status': {'$in': ['active', 'triggered', 'processing']},
-            },
-            {'_id': 1},
-        )
-        if existing:
-            return False  # already queued or already entered
-        result = feature_col.insert_one(doc)
-        if not result.inserted_id:
-            return False
+        # Serialize the check-then-insert below per (trade_id, leg_id): the
+        # websocket autorun loop and the fast-forward step API can both reach
+        # here for the same leg on the same tick, and without this lock both
+        # can pass the find_one before either insert_one lands — queuing the
+        # same parent leg twice (see _get_pending_entry_queue_lock docstring).
+        with _get_pending_entry_queue_lock(f'{trade_id}:{normalized_leg_id}'):
+            # Filter must include triggered/processing — if feature was already entered
+            # (status='triggered'), we must NOT insert a new 'active' feature.
+            # Using only status='active' caused duplicate entries: after first entry the
+            # feature becomes 'triggered', upsert misses it, inserts a new 'active' doc.
+            existing = feature_col.find_one(
+                {
+                    'trade_id': trade_id,
+                    'leg_id': normalized_leg_id,
+                    'feature': 'pending_entry',
+                    'status': {'$in': ['active', 'triggered', 'processing']},
+                },
+                {'_id': 1},
+            )
+            if existing:
+                return False  # already queued or already entered
+            result = feature_col.insert_one(doc)
+            if not result.inserted_id:
+                return False
         print(
             f'[PENDING ENTRY QUEUED] trade={trade_id} leg={normalized_leg_id} '
             f'leg_type={doc["leg_type"]} reentry_type={doc["reentry_type"] or "-"} '
@@ -3469,11 +3504,29 @@ def _process_momentum_pending_feature_legs(
     # print(f'[PENDING FEATURE FLOW] trade_id={trade_id} mode={activation_mode or "-"} state=start trade_date={trade_date or "-"} now_ts={now_ts}')
 
     try:
+        # Only reactivate rows whose claim is stale (no processing_started_at,
+        # or older than PROCESSING_CLAIM_STALE_SECONDS of real wall-clock time).
+        # Without this staleness check, a fresh claim taken moments ago by a
+        # still-in-flight concurrent call (e.g. the fast-forward step API
+        # racing the broker-tick worker — see the claim comment below) gets
+        # reset back to 'active' and re-claimed by the other caller before the
+        # first caller finishes, so the same leg gets entered twice.
+        # Stored/compared as a fixed-width ISO string (not a raw datetime) —
+        # this field is echoed straight into the execute-orders websocket
+        # payload, and a bare datetime object breaks json.dumps() there,
+        # silently killing that entire broadcast (caught by a broad
+        # except further up the call chain, so it fails invisibly).
+        stale_before_utc = (datetime.now(timezone.utc) - timedelta(seconds=PROCESSING_CLAIM_STALE_SECONDS)).strftime('%Y-%m-%dT%H:%M:%S.%f+00:00')
         reactivated = feature_col.update_many(
             {
                 'trade_id': trade_id,
                 'feature': {'$in': ['momentum_pending', 'pending_entry']},
                 'status': 'processing',
+                '$or': [
+                    {'processing_started_at': None},
+                    {'processing_started_at': {'$exists': False}},
+                    {'processing_started_at': {'$lt': stale_before_utc}},
+                ],
             },
             {'$set': {'status': 'active', 'processing_started_at': None}},
         )
@@ -3587,7 +3640,7 @@ def _process_momentum_pending_feature_legs(
         _doc_id = feat_doc.get('_id')
         _claimed = feature_col.find_one_and_update(
             {'_id': _doc_id, 'status': 'active'},
-            {'$set': {'status': 'processing', 'processing_started_at': now_ts}},
+            {'$set': {'status': 'processing', 'processing_started_at': datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%S.%f+00:00')}},
         )
         if _claimed is None:
             # print(f'[PENDING FEATURE FLOW] trade_id={trade_id} mode={activation_mode or "-"} state=claim_skipped feature_id={feat_doc.get("_id")} reason=already_claimed')
@@ -6340,8 +6393,13 @@ def _attach_leg_feature_statuses(db: 'MongoData', records: list[dict]) -> list[d
 
             leg_copy = dict(leg)
             leg_copy['feature_status_rows'] = feature_rows
+            # feature_rows is deduped by row _id only, so two rows that share the
+            # same feature key (e.g. two 'sl' docs created by a duplicate-entry
+            # race upstream) both survive here. Building feature_map keyed by
+            # feature_key naturally keeps one row per key (last one wins); derive
+            # active_trigger_descriptions from feature_map (not from feature_rows
+            # directly) so a leg never shows the same SL/TrailSL line twice.
             feature_map: dict[str, dict] = {}
-            active_descriptions: list[str] = []
             for row in feature_rows:
                 feature_key = str(row.get('feature') or '').strip()
                 if not feature_key:
@@ -6351,8 +6409,11 @@ def _attach_leg_feature_statuses(db: 'MongoData', records: list[dict]) -> list[d
                 if description:
                     row_copy['trigger_description'] = description
                 feature_map[feature_key] = row_copy
-                if description:
-                    active_descriptions.append(description)
+            active_descriptions = [
+                str(row.get('trigger_description') or '').strip()
+                for row in feature_map.values()
+                if row.get('trigger_description')
+            ]
             leg_copy['feature_status_map'] = feature_map
             leg_copy['feature_status_rows'] = list(feature_map.values()) if feature_map else feature_rows
             leg_copy['active_trigger_descriptions'] = active_descriptions
@@ -6554,8 +6615,17 @@ def _previous_session_close(col, underlying: str, today: str) -> float:
         if holidays_col.find_one({'date': day_str}):
             continue
 
+        # Lower bound anchored near close (15:20), NOT midnight — confirmed live
+        # this was the actual bug: a feed gap right before close (NIFTY's feed
+        # went quiet from ~10:56 to ~15:49 on 2026-07-14) meant no tick existed
+        # near 15:30, but `$gte: day_str` (midnight) still matched that stale
+        # 10:56 mid-morning tick as "the close" since it was merely the latest
+        # tick before 15:35 — nowhere near the real close. That produced a wrong
+        # previous_close (24121.19 instead of the genuine 24052.05, which only
+        # arrived late at 15:49:59 and got caught by the any_doc fallback below
+        # — but only once this window stopped falsely matching first.
         close_doc = col.find_one(
-            {'underlying': underlying, 'timestamp': {'$gte': day_str, '$lte': f'{day_str}T15:35:00'}},
+            {'underlying': underlying, 'timestamp': {'$gte': f'{day_str}T15:20:00', '$lte': f'{day_str}T15:35:00'}},
             sort=[('timestamp', -1)],
         )
         if close_doc:
@@ -6594,13 +6664,58 @@ def _equity_previous_close(raw_db, symbol: str) -> float:
     return _safe_float(doc.get('ch_closing_price'))
 
 
-# underlying → last-seen-good quote dict (same shape _quote_entry() returns).
-# Dhan's /marketfeed/quote can come back genuinely empty for a segment (no
-# trade yet today — common pre-market, or a transient 429/network hiccup),
-# in which case _fetch_dhan_index_quotes() below would otherwise just drop
-# that underlying entirely. Never evict: a slightly stale real quote is
-# always a better fallback than the UI showing "—" for change_pct/points.
-_LAST_GOOD_UNDERLYING_QUOTE: dict[str, dict] = {}
+# underlying → (session_day it was computed for, last-seen-good quote dict —
+# same shape _quote_entry() returns). Dhan's /marketfeed/quote can come back
+# genuinely empty for a segment (no trade yet today — common pre-market, or a
+# transient 429/network hiccup), in which case _fetch_dhan_index_quotes()
+# below would otherwise just drop that underlying entirely. Never evict: a
+# slightly stale *same-day* quote is a better fallback than the UI showing
+# "—" for change_pct/points.
+#
+# The session_day tag matters: this is process-lifetime state, so on a cold
+# start (or right after a broker reconnect), before *today's* first real
+# quote has landed even once, this dict can still hold YESTERDAY's last
+# quote — yesterday's spot_price paired with yesterday's prev_close. Serving
+# that pair as-is under today's label is worse than wrong: it looks like a
+# real, self-consistent tick (confirmed live: a stale spot+prev_close pair
+# from a prior session produced a plausible-looking but wrong change_pct for
+# exactly one cycle, self-correcting once the real quote arrived). Reusing
+# it is only safe when the cached entry is for the same session_day being
+# resolved right now — see the read site below.
+_LAST_GOOD_UNDERLYING_QUOTE: dict[str, tuple[str, dict]] = {}
+
+# underlying -> (session_day, prev_close) the FIRST time it was resolved that
+# session. _fetch_dhan_index_quotes runs every REST_REFRESH_INTERVAL_SECONDS
+# (1.5s) and, without this cache, re-resolves prev_close from scratch on every
+# single call: Dhan's live prev_close_map (dhan_ticker.py, populated by its
+# RESP_PREV_CLOSE WS packet) when present, else falling back to the
+# Mongo-derived _previous_session_close(). Those two sources don't always
+# agree to the last paisa, and prev_close_map can transiently read empty
+# between WS (re)subscribes — so which source wins was flipping cycle to
+# cycle, making change_pct/change_points visibly flicker between two close
+# but different numbers every ~1.5s even though the underlying spot price
+# itself was moving smoothly. Locking the reference in once per underlying
+# per session_day makes it stable regardless of which source resolved it.
+_STABLE_PREV_CLOSE: dict[str, tuple[str, float]] = {}
+
+
+def _resolve_stable_prev_close(underlying: str, session_day: str, live_prev_close: float, mongo_prev_close_fn) -> float:
+    cached = _STABLE_PREV_CLOSE.get(underlying)
+    if cached is not None and cached[0] == session_day and cached[1] > 0:
+        return cached[1]
+    # Our own recorded close (option_chain_index_spot / scanner EOD sync) is ground
+    # truth here — confirmed live that Dhan's WS prev_close_map can carry forward a
+    # stale value across a session boundary (no fresh RESP_PREV_CLOSE packet since
+    # the socket never dropped/resubscribed), e.g. NIFTY read 24121.19 from
+    # prev_close_map on a day its mongo-recorded close was genuinely 24052.05.
+    # live_prev_close is now only the cold-start fallback, for an underlying with
+    # no recorded close yet.
+    resolved = mongo_prev_close_fn()
+    if resolved <= 0:
+        resolved = live_prev_close
+    if resolved > 0:
+        _STABLE_PREV_CLOSE[underlying] = (session_day, resolved)
+    return resolved
 
 
 def _fetch_dhan_index_quotes(db: MongoData, underlyings: set[str]) -> dict[str, dict[str, float]]:
@@ -6694,12 +6809,25 @@ def _fetch_dhan_index_quotes(db: MongoData, underlyings: set[str]) -> dict[str, 
                     if spot_price <= 0:
                         continue
                     ohlc = info.get('ohlc') if isinstance(info.get('ohlc'), dict) else {}
-                    prev_close = _previous_session_close(col, underlying, session_day)
+                    # Prefer the option_chain_index_spot lookup (our own recorded
+                    # close) — Dhan's RESP_PREV_CLOSE WS packet (prev_close_map) is
+                    # only the cold-start fallback now, for an underlying with no
+                    # recorded close yet. See _resolve_stable_prev_close.
+                    from features.broker_gateway import broker_ticker_manager as _tm_pc  # type: ignore
+                    live_prev_close_dbg = _safe_float(_tm_pc.prev_close_map.get(str(token)))
+                    prev_close = _resolve_stable_prev_close(
+                        underlying, session_day,
+                        live_prev_close_dbg,
+                        lambda: _previous_session_close(col, underlying, session_day),
+                    )
+                    print(f"[DHAN QUOTE DEBUG] underlying={underlying} token={token} "
+                          f"raw_info={info} ws_prev_close_map={live_prev_close_dbg} "
+                          f"resolved_prev_close={prev_close}")
                     quotes[underlying] = _quote_entry(
                         spot_price, prev_close,
                         _safe_float(ohlc.get('open')), _safe_float(ohlc.get('high')), _safe_float(ohlc.get('low')),
                     )
-                    _LAST_GOOD_UNDERLYING_QUOTE[underlying] = quotes[underlying]
+                    _LAST_GOOD_UNDERLYING_QUOTE[underlying] = (session_day, quotes[underlying])
                 except Exception as exc:
                     log.debug('dhan index quote per-underlying error underlying=%s token=%s: %s', underlying, token, exc)
     except Exception as exc:
@@ -6746,9 +6874,17 @@ def _fetch_dhan_index_quotes(db: MongoData, underlyings: set[str]) -> dict[str, 
                     spot_price = _safe_float(info.get('ltp'))
                     if spot_price <= 0:
                         continue
-                    prev_close = _equity_previous_close(raw_db, underlying)
+                    # Same RESP_PREV_CLOSE-first preference as the index branch
+                    # above — falls back to the scanner's daily EOD sync only
+                    # while this token's prev_close_map entry hasn't arrived yet.
+                    from features.broker_gateway import broker_ticker_manager as _tm_pc2  # type: ignore
+                    prev_close = _resolve_stable_prev_close(
+                        underlying, session_day,
+                        _safe_float(_tm_pc2.prev_close_map.get(str(sec_id))),
+                        lambda underlying=underlying: _equity_previous_close(raw_db, underlying),
+                    )
                     quotes[underlying] = _quote_entry(spot_price, prev_close, 0.0, 0.0, 0.0)
-                    _LAST_GOOD_UNDERLYING_QUOTE[underlying] = quotes[underlying]
+                    _LAST_GOOD_UNDERLYING_QUOTE[underlying] = (session_day, quotes[underlying])
         except Exception as exc:
             log.debug('dhan stock equity quote error underlyings=%s: %s', stock_underlyings, exc)
 
@@ -6763,15 +6899,20 @@ def _fetch_dhan_index_quotes(db: MongoData, underlyings: set[str]) -> dict[str, 
         if spot_price > 0:
             prev_close = _previous_session_close(col, underlying, session_day)
             quotes[underlying] = _quote_entry(spot_price, prev_close, 0.0, 0.0, 0.0)
-            _LAST_GOOD_UNDERLYING_QUOTE[underlying] = quotes[underlying]
+            _LAST_GOOD_UNDERLYING_QUOTE[underlying] = (session_day, quotes[underlying])
 
     # Last resort — Dhan returned nothing for this underlying on this call
     # (pre-market quiet segment, transient 429, etc.): reuse the last real
     # quote we ever saw for it instead of dropping it (which the UI renders
-    # as a bare "—" for spot/change_pct/change_points).
+    # as a bare "—" for spot/change_pct/change_points). Only if it's from
+    # *today's* session_day though — a cross-day stale pair (yesterday's
+    # spot_price next to yesterday's prev_close) looks like a real tick, not
+    # an obvious "—", so silently serving it under today's label is worse
+    # than just waiting one more cycle for the real quote.
     for underlying in underlyings:
-        if underlying not in quotes and underlying in _LAST_GOOD_UNDERLYING_QUOTE:
-            quotes[underlying] = _LAST_GOOD_UNDERLYING_QUOTE[underlying]
+        cached = _LAST_GOOD_UNDERLYING_QUOTE.get(underlying)
+        if underlying not in quotes and cached is not None and cached[0] == session_day:
+            quotes[underlying] = cached[1]
 
     return quotes
 
@@ -7387,20 +7528,63 @@ def _fetch_dhan_broker_option_positions(
         buy_avg = _safe_float(row.get('buyAvg'))
         sell_avg = _safe_float(row.get('sellAvg'))
         cost_price = _safe_float(row.get('costPrice'))
-        # Dhan doesn't expose fill order, so for a squared-off leg we assume the
-        # side with the larger filled quantity was the original entry direction.
-        position = 'BUY' if (net_qty > 0 or (exited and buy_qty >= sell_qty)) else 'SELL'
+        carry_forward_buy_qty = _safe_int(row.get('carryForwardBuyQty'))
+        carry_forward_sell_qty = _safe_int(row.get('carryForwardSellQty'))
+
+        if net_qty > 0:
+            position = 'BUY'
+        elif net_qty < 0:
+            position = 'SELL'
+        elif carry_forward_buy_qty > 0 and carry_forward_sell_qty <= 0:
+            # Squared-off leg: whichever side carried a quantity in from a
+            # prior day was the original entry — Dhan doesn't expose fill
+            # order directly, but carryForwardBuyQty/carryForwardSellQty
+            # settles it outright when only one side has one.
+            position = 'BUY'
+        elif carry_forward_sell_qty > 0 and carry_forward_buy_qty <= 0:
+            position = 'SELL'
+        else:
+            # Pure same-day round trip, no carry-forward on either side to
+            # disambiguate — Dhan's own costPrice still designates one side
+            # as "entry" here (verified: it lands on the sell side in every
+            # such case observed), so mirror that instead of guessing off qty.
+            position = 'SELL'
 
         if exited:
-            entry_price = (buy_avg if position == 'BUY' else sell_avg) or _safe_float(
-                row.get('avgPrice') or row.get('averagePrice') or row.get('netPrice')
-            )
-            exit_price = sell_avg if position == 'BUY' else buy_avg
+            # The side that carried a quantity in from a prior day has its
+            # raw buyAvg/sellAvg superseded by costPrice for the SAME reason
+            # as the open-position case below: costPrice is the MTM-settled
+            # basis, raw is the stale pre-settlement average. The other side
+            # — today's actual closing trade — keeps its raw average as-is.
+            # Verified against Dhan's own app: a carried-short-then-covered
+            # leg showed Buy Avg = raw buyAvg (today's cover) and Sell Avg =
+            # costPrice (not raw sellAvg), and its displayed per-row P&L only
+            # reconciles using that costPrice, not the lifetime realizedProfit
+            # API field (which still includes days already MTM-settled).
+            if position == 'BUY':
+                entry_price = cost_price or buy_avg or _safe_float(
+                    row.get('avgPrice') or row.get('averagePrice') or row.get('netPrice')
+                )
+                exit_price = sell_avg
+            else:
+                entry_price = cost_price or sell_avg or _safe_float(
+                    row.get('avgPrice') or row.get('averagePrice') or row.get('netPrice')
+                )
+                exit_price = buy_avg
         else:
-            # Dhan's own "Avg Price" UI column is buyAvg/sellAvg (whichever
-            # side this leg is on) — costPrice is only a fallback for when
-            # Dhan hasn't populated buyAvg/sellAvg for this leg at all.
-            entry_price = (buy_avg if position == 'BUY' else sell_avg) or cost_price
+            # For an OPEN carried F&O position, Dhan's app shows costPrice
+            # (the MTM-settled cost basis) as the "Avg Price" — confirmed
+            # against Dhan's own app: a multi-day-carried leg's displayed
+            # avg matched costPrice, not buyAvg/sellAvg, and unrealizedProfit
+            # only reconciles against costPrice for such legs. buyAvg/sellAvg
+            # is the lifetime raw execution average, which for a carried
+            # position no longer matches current cost — part of the
+            # buyAvg-vs-market gap was already booked as realized MTM on
+            # earlier days. For a same-day-only position (no carry forward)
+            # costPrice and buyAvg/sellAvg are identical anyway, so this
+            # never regresses that case; buyAvg/sellAvg is only a fallback
+            # for when Dhan hasn't populated costPrice for this leg at all.
+            entry_price = cost_price or (buy_avg if position == 'BUY' else sell_avg)
             exit_price = 0.0
 
         rest_quote = rest_quote_map.get(token) or {}
@@ -7411,13 +7595,44 @@ def _fetch_dhan_broker_option_positions(
             or row.get('ltp')
             or row.get('lastTradedPrice')
         )
-        if exited:
-            ltp = exit_price or entry_price
-        elif ltp <= 0:
-            ltp = entry_price
+        if ltp <= 0:
+            # Dhan keeps quoting a squared-off contract's real market price
+            # (it still shows a live LTP for closed rows) — only fall back
+            # to the trade prices themselves when no live/REST quote exists
+            # for this token at all.
+            ltp = (exit_price or entry_price) if exited else entry_price
+
+        unrealized_pnl = 0.0
+        if not exited:
+            # Simple (ltp - entry) * netQty only holds when this leg's net
+            # quantity came from trades on one side alone. Once a leg has
+            # both a buy and a sell fill while still net open (partial
+            # cover-and-reshort, or partial book-and-add), Dhan's own P&L
+            # values it as: the whole opposite-side quantity marked at the
+            # carry-adjusted costPrice, netted against the same-side
+            # quantity at its own raw fill price — verified against Dhan's
+            # app on a mixed SHORT leg (sellQty=130, buyQty=65) where plain
+            # (costPrice-ltp)*netQty was off by ~4.5x from the real P&L.
+            if net_qty < 0:
+                unrealized_pnl = sell_qty * (cost_price - ltp) - buy_qty * (buy_avg - ltp)
+            elif net_qty > 0:
+                unrealized_pnl = buy_qty * (ltp - cost_price) - sell_qty * (ltp - sell_avg)
 
         quantity = abs(net_qty) if not exited else max(buy_qty, sell_qty)
-        realized_pnl = _safe_float(row.get('realizedProfit')) if exited else 0.0
+        if exited:
+            # Dhan's own per-row closed P&L reconciles against entry_price
+            # (costPrice-adjusted where a carry-forward side is involved)
+            # vs. the raw closing trade price — not the API's realizedProfit
+            # field, which is the lifetime cumulative figure and still
+            # includes days already settled via MTM before today. Verified:
+            # a carried-short-then-covered leg had realizedProfit=-3328 but
+            # Dhan's displayed row/aggregate P&L was -2219.75, matching
+            # (costPrice - buyAvg) * qty exactly.
+            realized_pnl = (
+                (exit_price - entry_price) if position == 'BUY' else (entry_price - exit_price)
+            ) * quantity
+        else:
+            realized_pnl = 0.0
         symbol = str(
             token_doc.get('symbol')
             or row.get('tradingSymbol')
@@ -7450,6 +7665,17 @@ def _fetch_dhan_broker_option_positions(
             'quantity': quantity,
             'exited': exited,
             'realized_pnl': realized_pnl,
+            'unrealized_pnl': unrealized_pnl,
+            'pnl': realized_pnl if exited else unrealized_pnl,
+            # Raw per-side fill data — kept alongside the single entry_price
+            # so the frontend can recompute unrealized_pnl on a live LTP tick
+            # for mixed buy+sell-while-still-open legs (see unrealized_pnl
+            # comment above); plain (entry_price - live_ltp) * quantity is
+            # only correct when one of these two qtys is zero.
+            'buy_qty': buy_qty,
+            'sell_qty': sell_qty,
+            'buy_avg_price': buy_avg,
+            'sell_avg_price': sell_avg,
             'timestamp': datetime.now().strftime('%Y-%m-%dT%H:%M:%S'),
             'symbol': symbol,
             'token': token,

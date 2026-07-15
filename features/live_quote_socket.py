@@ -508,6 +508,7 @@ class _LiveQuoteHub:
                 "spot_price": spot_price,
                 "change_pct": quote.get("change_pct"),
                 "change_points": quote.get("change_points"),
+                "previous_close": quote.get("previous_close"),
             })
         return changed
 

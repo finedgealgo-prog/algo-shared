@@ -15,6 +15,7 @@ reports its fill correctly) before any live strategy is allowed to rely on it un
 """
 
 import logging
+import time
 
 import requests
 
@@ -72,28 +73,47 @@ class DhanAdapter:
         price: float = 0.0,
         trigger_price: float = 0.0,
         validity: str = 'DAY',
+        security_id: str = '',
+        exchange_segment: str = '',
     ) -> str:
-        security_id, exchange_segment = self._resolve_security(tradingsymbol, exchange)
+        # Prefer a security_id/exchange_segment the caller already resolved unambiguously
+        # (by strike+expiry+option_type) over re-deriving it here from tradingsymbol alone —
+        # Dhan's own tradingSymbol convention (e.g. "NIFTY-Jul2026-24200-PE") doesn't encode
+        # which week's contract it is, so active_option_tokens has one row per weekly expiry
+        # all sharing that identical symbol string, and _resolve_security's symbol-only lookup
+        # can return any one of them — including an already-expired week's security_id.
+        if not security_id or not exchange_segment:
+            security_id, exchange_segment = self._resolve_security(tradingsymbol, exchange)
         if not security_id:
             raise Exception(f'Dhan security_id not found for symbol={tradingsymbol}')
 
         dhan_order_type = _ORDER_TYPE_TO_DHAN.get(order_type, 'LIMIT')
+        # Fields always present in Dhan's own documented sample payload — disclosedQuantity,
+        # triggerPrice, and afterMarketOrder were previously omitted/conditional here (triggerPrice
+        # only sent for SL orders), unlike Dhan's sample which always sends all three (0/false when
+        # not applicable). DH-905 is a generic Input_Exception bucket ("missing required fields, bad
+        # values for parameters etc.") per Dhan's own docs, so a request shape gap here can plausibly
+        # surface as an unrelated-looking error (e.g. "Invalid SecurityId") instead of naming the
+        # actually-missing field.
         payload: dict = {
             'dhanClientId': self.client_id,
+            'correlationId': f'order_{int(time.time() * 1000)}',
             'transactionType': 'BUY' if transaction_type == 'BUY' else 'SELL',
             'exchangeSegment': exchange_segment,
             'productType': 'INTRADAY' if product == 'MIS' else 'MARGIN',
             'orderType': dhan_order_type,
             'validity': str(validity or 'DAY').upper(),
-            'tradingSymbol': tradingsymbol,
             'securityId': security_id,
             'quantity': int(quantity),
+            'disclosedQuantity': 0,
             'price': round(float(price or 0), 2) if dhan_order_type in ('LIMIT', 'STOP_LOSS') else 0,
+            'triggerPrice': round(float(trigger_price or 0), 2),
+            'afterMarketOrder': False,
         }
-        if dhan_order_type in ('STOP_LOSS', 'STOP_LOSS_MARKET') and trigger_price:
-            payload['triggerPrice'] = round(float(trigger_price), 2)
+        print(f'[DHAN PLACE_ORDER] payload={payload}', flush=True)
 
         resp = requests.post(f'{_DHAN_API_BASE}/orders', json=payload, headers=self._headers(), timeout=10)
+        print(f'[DHAN PLACE_ORDER] response status={resp.status_code} body={resp.text[:500]}', flush=True)
         if resp.status_code not in (200, 201):
             raise Exception(f'Dhan PlaceOrder failed: HTTP {resp.status_code} {resp.text[:300]}')
         data = resp.json() if resp.text else {}
@@ -106,6 +126,43 @@ class DhanAdapter:
         if resp.status_code not in (200, 202):
             raise Exception(f'Dhan CancelOrder failed: HTTP {resp.status_code} {resp.text[:300]}')
         return order_id
+
+    # ── modify_order ─────────────────────────────────────────────────────────
+    # Was missing entirely — broker_modify_order (api.py) called this for every
+    # broker generically; on Dhan it hit AttributeError instead of modifying
+    # anything. exchange/tradingsymbol accepted only to match the shared
+    # adapter signature (FlatTradeAdapter.modify_order) — Dhan's PUT /orders/
+    # {id} identifies the order purely by orderId, no symbol needed.
+
+    def modify_order(
+        self,
+        variety: str = 'regular',   # noqa: ignored — Dhan has no variety concept
+        order_id: str = '',
+        order_type: str = 'LIMIT',
+        quantity: int | None = None,
+        price: float = 0.0,
+        trigger_price: float = 0.0,
+        validity: str = 'DAY',
+        exchange: str = '',
+        tradingsymbol: str = '',
+    ) -> str:
+        dhan_order_type = _ORDER_TYPE_TO_DHAN.get(order_type, 'LIMIT')
+        payload: dict = {
+            'dhanClientId': self.client_id,
+            'orderId': str(order_id),
+            'orderType': dhan_order_type,
+            'validity': str(validity or 'DAY').upper(),
+            'price': round(float(price or 0), 2) if dhan_order_type in ('LIMIT', 'STOP_LOSS') else 0,
+            'triggerPrice': round(float(trigger_price or 0), 2),
+            'disclosedQuantity': 0,
+        }
+        if quantity is not None:
+            payload['quantity'] = int(quantity)
+        resp = requests.put(f'{_DHAN_API_BASE}/orders/{order_id}', json=payload, headers=self._headers(), timeout=10)
+        if resp.status_code not in (200, 202):
+            raise Exception(f'Dhan ModifyOrder failed: HTTP {resp.status_code} {resp.text[:300]}')
+        data = resp.json() if resp.text else {}
+        return str(data.get('orderId') or order_id)
 
     # ── orders ───────────────────────────────────────────────────────────────
 

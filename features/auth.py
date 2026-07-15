@@ -194,19 +194,25 @@ def authenticate_user(db, mobile_raw: str, password: str) -> dict[str, Any]:
 
 
 def _authenticate_request(authorization: Optional[str]) -> dict[str, Any]:
+    import time as _t  # TEMPORARY DIAGNOSTIC — remove with the prints below
+    _t0 = _t.perf_counter()
     if not authorization or not authorization.lower().startswith("bearer "):
         raise HTTPException(status_code=401, detail="Missing authentication token")
     token = authorization.split(" ", 1)[1].strip()
     claims = decode_access_token(token)
+    print(f"[TIMING auth] decode_access_token done t={_t.perf_counter()-_t0:.3f}s")
 
     from bson import ObjectId
     from features.mongo_data import MongoData
 
     db = MongoData()
+    print(f"[TIMING auth] MongoData() instance ready t={_t.perf_counter()-_t0:.3f}s")
     col = db._db[USERS_COLLECTION]
     try:
         doc = col.find_one({"_id": ObjectId(claims["sub"])})
-    except Exception:
+        print(f"[TIMING auth] find_one user done t={_t.perf_counter()-_t0:.3f}s")
+    except Exception as exc:
+        print(f"[TIMING auth] find_one user FAILED: {exc} t={_t.perf_counter()-_t0:.3f}s")
         doc = None
     if not doc:
         raise HTTPException(status_code=401, detail="User not found")

@@ -57,7 +57,13 @@ from features.telegram_notifier import notify_admin, notify_user
 # cancel call for every live SL/TG/entry/squareoff scenario below goes through here
 # instead of calling the adapter in-process; everything above that one call (tick
 # processing, decision logic, registry bookkeeping) is unchanged and still lives here.
-ORDER_SERVICE_URL = 'http://localhost:8004/order'
+#
+# Must be the real public address, not localhost — algo.order runs on its own
+# dedicated box (13.202.184.58, the one whitelisted with the broker for live
+# order placement), not colocated with whichever service imports this module
+# (algo.trade/algo.simulator run on a separate box). "localhost:8004" would
+# silently mean "nothing listening" wherever this isn't algo.order itself.
+ORDER_SERVICE_URL = 'https://order.finedgealgo.com/order'
 
 # Server-to-server auth for the calls above — this is a background tick-processing
 # loop, not a logged-in user's request, so there's no user JWT to send. Must match
@@ -96,6 +102,52 @@ _ORDER_STATUS_TRIGGER_PENDING = 'TRIGGER_PENDING'
 _NFO_TICK_SIZE = 0.05  # NSE F&O tick size
 
 
+def _dhan_broker_kwargs_for_leg(db, trade: dict, expiry, strike, option_type) -> dict:
+    """
+    Resolves Dhan's security_id/exchange_segment for this leg by underlying+strike+
+    expiry+option_type — same disambiguation _resolve_dhan_security (algo.order/
+    algo.simulator's own copies) uses, since Dhan's own tradingSymbol convention
+    (e.g. "NIFTY-Jul2026-24200-PE") doesn't encode which week's contract it is:
+    active_option_tokens has one row per weekly expiry all sharing that identical
+    string, and letting DhanAdapter.place_order() re-resolve by that ambiguous
+    symbol alone risks silently picking a different (even expired) week's contract.
+
+    Returns {} for non-Dhan trades (Kite/FlatTrade symbols are already unambiguous,
+    no extra kwargs needed) or whenever resolution fails — in which case the broker
+    call falls back to place_order()'s own, less precise, resolution attempt rather
+    than blocking the order outright.
+    """
+    try:
+        raw_db = db._db if hasattr(db, '_db') else db
+        broker_doc_id = str(trade.get('broker') or '').strip()
+        dhan_cfg = raw_db['kite_market_config'].find_one({'broker': 'dhan'}) or {}
+        dhan_id = str(dhan_cfg.get('_id') or '')
+        is_dhan = (
+            (broker_doc_id and broker_doc_id == dhan_id)
+            or (not broker_doc_id and str(dhan_cfg.get('broker') or '').lower() == 'dhan' and dhan_cfg.get('enabled'))
+        )
+        if not is_dhan:
+            return {}
+        underlying = str(trade.get('underlying') or '').strip().upper()
+        doc = raw_db['active_option_tokens'].find_one({
+            'broker': 'dhan',
+            'instrument': underlying,
+            'expiry': str(expiry or '').strip()[:10],
+            'strike': float(strike or 0),
+            'option_type': str(option_type or '').strip().upper(),
+        })
+        if not doc:
+            return {}
+        security_id = str(doc.get('token') or doc.get('tokens') or '').strip()
+        if not security_id:
+            return {}
+        exchange_segment = str(doc.get('ws_segment') or '').strip().upper() or 'NSE_FNO'
+        return {'security_id': security_id, 'exchange_segment': exchange_segment}
+    except Exception as exc:
+        log.debug('[DHAN BROKER KWARGS] resolve error: %s', exc)
+        return {}
+
+
 def _remote_place_broker_order(
     trade_broker_id: str | None,
     *,
@@ -110,11 +162,16 @@ def _remote_place_broker_order(
     trigger_price: float = 0.0,
     validity: str = 'DAY',
     context: dict | None = None,
+    broker_kwargs: dict | None = None,
 ) -> dict:
     """
     Same contract as features.order_execution.place_broker_order (never raises —
     any failure comes back as {"status": "error", ...}) — the broker adapter is
     resolved and called inside algo.order instead of in this process.
+
+    broker_kwargs: opaque extra kwargs (see _dhan_broker_kwargs_for_leg) forwarded
+    to algo.order's /broker/place, which forwards them again to place_broker_order
+    — this function stays broker-agnostic, same as place_broker_order itself.
     """
     try:
         resp = requests.post(
@@ -132,6 +189,7 @@ def _remote_place_broker_order(
                 'trigger_price': trigger_price,
                 'validity': validity,
                 'context': context or {},
+                'broker_kwargs': broker_kwargs or {},
             },
             headers=_INTERNAL_HEADERS,
             timeout=5.0,
@@ -1941,6 +1999,7 @@ def place_live_entry_order(
             price=order_params.get('price', 0.0),
             trigger_price=order_params.get('trigger_price', 0.0),
             context={'trade_id': trade_id, 'leg_id': leg_id, 'purpose': 'entry', 'symbol': symbol},
+            broker_kwargs=_dhan_broker_kwargs_for_leg(db, trade, leg.get('expiry_date'), leg.get('strike'), leg.get('option')),
         )
         if result['status'] != 'success':
             log.error('[LIVE ORDER FAILED] trade=%s leg=%s symbol=%s: %s', trade_id, leg_id, symbol, result['message'])
@@ -2161,6 +2220,7 @@ def place_live_exit_order(
             price=order_params.get('price', 0.0),
             trigger_price=order_params.get('trigger_price', 0.0),
             context={'trade_id': trade_id, 'leg_id': leg_id, 'purpose': f'exit:{exit_reason}', 'symbol': symbol},
+            broker_kwargs=_dhan_broker_kwargs_for_leg(db, trade, leg.get('expiry_date'), leg.get('strike'), leg.get('option')),
         )
         if result['status'] != 'success':
             log.error('[LIVE EXIT ORDER FAILED] trade=%s leg=%s: %s', trade_id, leg_id, result['message'])
@@ -2792,7 +2852,7 @@ def live_manual_square_off_trade(db, trade: dict) -> dict:
         'status': 1,
         'exit_trade': None,
         'entry_trade.entry_lifecycle_status': 'active',
-    }, {'leg_id': 1, 'symbol': 1, 'quantity': 1, 'lot_size': 1, 'position': 1}))
+    }, {'leg_id': 1, 'symbol': 1, 'quantity': 1, 'lot_size': 1, 'position': 1, 'strike': 1, 'option': 1, 'expiry_date': 1}))
 
     for hist in active_hist_docs:
         leg_id = str(hist.get('leg_id') or '').strip()
@@ -2827,6 +2887,7 @@ def live_manual_square_off_trade(db, trade: dict) -> dict:
                 quantity=qty, order_type=_ORDER_TYPE_LIMIT, price=exit_price, product=product,
                 variety=_VARIETY_REGULAR,
                 context={'trade_id': trade_id, 'leg_id': leg_id, 'purpose': 'manual_squareoff', 'symbol': symbol},
+                broker_kwargs=_dhan_broker_kwargs_for_leg(db, trade, hist.get('expiry_date'), hist.get('strike'), hist.get('option')),
             )
             if result['status'] != 'success':
                 log.error('[MANUAL SQ] exit order failed trade=%s leg=%s symbol=%s: %s',
@@ -2878,7 +2939,7 @@ def _rejection_squareoff_all(db, trade: dict, broker, _now_ts: str, rejected_leg
             'exit_trade': None,
             'entry_trade.entry_lifecycle_status': 'active',
         },
-        {'leg_id': 1, 'symbol': 1, 'quantity': 1, 'lot_size': 1, 'position': 1},
+        {'leg_id': 1, 'symbol': 1, 'quantity': 1, 'lot_size': 1, 'position': 1, 'strike': 1, 'option': 1, 'expiry_date': 1},
     ))
     for hist in open_legs:
         symbol   = str(hist.get('symbol') or '').strip()
@@ -2898,6 +2959,7 @@ def _rejection_squareoff_all(db, trade: dict, broker, _now_ts: str, rejected_leg
             quantity=qty, order_type=_ORDER_TYPE_LIMIT, price=exit_price, product=product,
             variety=_VARIETY_REGULAR,
             context={'trade_id': trade_id, 'leg_id': leg_id, 'purpose': 'rejection_squareoff', 'symbol': symbol},
+            broker_kwargs=_dhan_broker_kwargs_for_leg(db, trade, hist.get('expiry_date'), hist.get('strike'), hist.get('option')),
         )
         if result['status'] != 'success':
             log.error('[SQUAREOFF ALL LEGS FAILED] trade=%s leg=%s symbol=%s: %s', trade_id, leg_id, symbol, result['message'])
@@ -2918,7 +2980,7 @@ def _margin_squareoff_trade(db, trade: dict, kite, _now_ts: str) -> None:
     hist_col = db._db['algo_trade_positions_history']
     open_legs = list(hist_col.find(
         {'trade_id': trade_id, 'status': 1, 'exit_trade': None},
-        {'leg_id': 1, 'symbol': 1, 'quantity': 1, 'lot_size': 1, 'position': 1},
+        {'leg_id': 1, 'symbol': 1, 'quantity': 1, 'lot_size': 1, 'position': 1, 'strike': 1, 'option': 1, 'expiry_date': 1},
     ))
     for hist in open_legs:
         symbol   = str(hist.get('symbol') or '').strip()
@@ -2938,6 +3000,7 @@ def _margin_squareoff_trade(db, trade: dict, kite, _now_ts: str) -> None:
             quantity=qty, order_type=_ORDER_TYPE_LIMIT, price=exit_price, product=product,
             variety=_VARIETY_REGULAR,
             context={'trade_id': trade_id, 'leg_id': leg_id, 'purpose': 'margin_squareoff', 'symbol': symbol},
+            broker_kwargs=_dhan_broker_kwargs_for_leg(db, trade, hist.get('expiry_date'), hist.get('strike'), hist.get('option')),
         )
         if result['status'] != 'success':
             log.error('[MARGIN SQUAREOFF FAILED] trade=%s symbol=%s: %s', trade_id, symbol, result['message'])
@@ -2959,6 +3022,12 @@ def _convert_to_aggressive_limit(
     """
     trade_id = str(trade.get('_id') or '')
     leg_id   = str(hist_doc.get('leg_id') or '')
+    # hist_doc here is the enriched dict _iter_pending_live_entry_orders built
+    # (source/trade_id/leg_id/entry_trade/history_id only) — strike/option/expiry_date
+    # aren't in it, so fetch them fresh for the Dhan security-id resolution below.
+    _leg_doc = db._db['algo_trade_positions_history'].find_one(
+        {'trade_id': trade_id, 'leg_id': leg_id}, {'strike': 1, 'option': 1, 'expiry_date': 1},
+    ) or {}
     symbol   = str(kite_order.get('tradingsymbol') or '').strip()
     exchange = str(kite_order.get('exchange') or '').strip().upper()
     txn_type = str(kite_order.get('transaction_type') or '').upper()
@@ -3008,6 +3077,7 @@ def _convert_to_aggressive_limit(
             quantity=qty, order_type=_ORDER_TYPE_LIMIT, price=limit_price, product=product,
             variety=_VARIETY_REGULAR,
             context={'trade_id': trade_id, 'leg_id': leg_id, 'purpose': 'aggressive_retry', 'symbol': symbol},
+            broker_kwargs=_dhan_broker_kwargs_for_leg(db, trade, _leg_doc.get('expiry_date'), _leg_doc.get('strike'), _leg_doc.get('option')),
         )
         if result['status'] != 'success':
             log.error('[AGGRESSIVE LIMIT FAILED] trade=%s leg=%s symbol=%s: %s', trade_id, leg_id, symbol, result['message'])

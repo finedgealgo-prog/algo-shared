@@ -228,11 +228,15 @@ def _verify_signature(order_id: str, payment_id: str, signature: str) -> bool:
 
 @payment_router.get("/auth/subscriptions")
 def get_subscriptions(current_user: dict = Depends(app_auth.require_current_user)):
+    import time as _t  # TEMPORARY DIAGNOSTIC — remove with the prints below
+    _t0 = _t.perf_counter()
+    print(f"[TIMING auth/subscriptions] ENTER (auth already resolved) t=0.000s")
     user_id = str(current_user["_id"])
     db      = MongoData()._db
     now     = datetime.now(timezone.utc).isoformat()
 
     docs   = list(db[SUBSCRIPTIONS_COL].find({"user_id": user_id}))
+    print(f"[TIMING auth/subscriptions] find() done, {len(docs)} docs t={_t.perf_counter()-_t0:.3f}s")
     result = []
     for d in docs:
         status     = d.get("status", "active")
@@ -249,6 +253,7 @@ def get_subscriptions(current_user: dict = Depends(app_auth.require_current_user
             "expires_at": expires_at,
             "created_at": d.get("created_at"),
         })
+    print(f"[TIMING auth/subscriptions] EXIT t={_t.perf_counter()-_t0:.3f}s")
     return result
 
 

@@ -192,6 +192,14 @@ class _BrokerTickerProxy:
         return getattr(self._delegate, 'ltp_ts_map', {})
 
     @property
+    def prev_close_map(self):
+        # Previous trading day's close, from Dhan's dedicated RESP_PREV_CLOSE
+        # (packet code 6) WS packets — see dhan_ticker.py. Empty on Kite (no
+        # equivalent tracked); callers should keep their Mongo-based fallback
+        # for the Kite path / until this map has warmed up post-connect.
+        return getattr(self._delegate, 'prev_close_map', {})
+
+    @property
     def _ticker(self):           return self._delegate._ticker
 
     def get_ltp(self, token):            return self._delegate.get_ltp(token)
@@ -490,6 +498,18 @@ def get_broker_rest_quotes(
         _max_len = max((len(ids) for ids in missing_by_segment.values()), default=0)
         _num_batches = (_max_len + _BATCH - 1) // _BATCH if _max_len else 0
 
+        # Tokens never seen before (just-warmed chain, e.g. a newly opened
+        # expiry tab) have no _LAST_GOOD_QUOTE to fall back on — for them a
+        # skipped call means this row renders ltp=0 to the user, not "serve
+        # slightly-stale cache". A steady-state refresh for already-known
+        # tokens can safely skip-on-busy (WS/cache already has a real price),
+        # but the first-ever fetch for a chain must wait for its rate-gate
+        # slot instead of giving up, same reasoning as dhan_quote_post_blocking's
+        # docstring. Without this, switching to a rarely-viewed expiry while
+        # another chain is actively polling (and thus usually holding the
+        # shared 1-req/sec slot) reliably lost the race and showed ltp=0.
+        _has_never_seen = bool(set(missing) & set(_not_subscribed))
+
         for _batch_idx in range(_num_batches):
             req_body: dict = {
                 segment: [
@@ -504,7 +524,11 @@ def get_broker_rest_quotes(
 
             if _not_subscribed:
                 debug_print(f'[REST_QUOTES_DEBUG] calling Dhan REST batch={_batch_idx} req_body={req_body}')
-            resp = dhan_quote_post(req_body, access_token, client_id, timeout=10.0)
+            resp = (
+                dhan_quote_post_blocking(req_body, access_token, client_id, timeout=10.0)
+                if _has_never_seen
+                else dhan_quote_post(req_body, access_token, client_id, timeout=10.0)
+            )
             if resp is None:
                 # Globally throttled — some other caller in this process hit
                 # Dhan within the last ~1.05s. Remaining batches (if any)

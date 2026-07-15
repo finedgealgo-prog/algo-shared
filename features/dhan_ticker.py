@@ -198,6 +198,7 @@ class _DhanTickerManager:
         self.ltp_ts_map:      dict[str, str]   = {}   # token → ISO timestamp of last tick received
         self.ltp_trade_ts_map: dict[str, int]  = {}   # token → Unix epoch of last actual trade
         self.oi_map:          dict[str, int]   = {}   # token → open interest (from Full packets)
+        self.prev_close_map:  dict[str, float] = {}   # token → previous trading day's close (from RESP_PREV_CLOSE packets)
         # Best (level-0) bid/ask, from Full packets' market-depth block — see
         # _handle_binary's RESP_FULL branch. Only ever populated for tokens actually
         # subscribed with REQ_FULL_SUB (F&O option legs on the main connection; the
@@ -314,6 +315,7 @@ class _DhanTickerManager:
             self.ltp_ts_map         = {}
             self.ltp_trade_ts_map   = {}
             self.oi_map             = {}
+            self.prev_close_map     = {}
             self.bid_map            = {}
             self.ask_map            = {}
             self.spot_map           = {}
@@ -994,6 +996,15 @@ class _DhanTickerManager:
                 continue
 
             sid_str = str(security_id)
+
+            # Previous Day Data packet (code 6) — first float is yesterday's
+            # closing price, not a live tick. Keep it in its own map so
+            # change_pct/change_points can read a genuine prior-close without
+            # a Mongo lookup; must not land in ltp_map (that's "current price").
+            if feed_code == RESP_PREV_CLOSE:
+                self.prev_close_map[sid_str] = ltp_val
+                continue
+
             self.ltp_map[sid_str]    = ltp_val
             self.ltp_ts_map[sid_str] = now_ts
             changed[sid_str]         = ltp_val
