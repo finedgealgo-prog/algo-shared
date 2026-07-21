@@ -200,9 +200,9 @@ class _DhanTickerManager:
         self.oi_map:          dict[str, int]   = {}   # token → open interest (from Full packets)
         self.prev_close_map:  dict[str, float] = {}   # token → previous trading day's close (from RESP_PREV_CLOSE packets)
         # Best (level-0) bid/ask, from Full packets' market-depth block — see
-        # _handle_binary's RESP_FULL branch. Only ever populated for tokens actually
-        # subscribed with REQ_FULL_SUB (F&O option legs on the main connection; the
-        # chain-warming pool uses Ticker-only mode and never touches these).
+        # _handle_binary's RESP_FULL branch (main connection, live positions)
+        # and _handle_chain_binary's mirror of it (chain-feed pool, whole
+        # option chains — also REQ_FULL_SUB as of the option-chain latency fix).
         self.bid_map:         dict[str, float] = {}
         self.ask_map:         dict[str, float] = {}
         self.spot_map:        dict[str, float] = {}
@@ -628,11 +628,17 @@ class _DhanTickerManager:
 
     def _send_chain_subscribe(self, ws, security_ids: list[str], exchange: str) -> None:
         # Dhan caps subscribe messages at 100 instruments each — same chunking
-        # rule as the main connection's _send_subscribe.
+        # rule as the main connection's _send_subscribe. REQ_FULL_SUB (not
+        # REQ_TICKER_SUB) — Dhan's docs cap instrument count identically per
+        # connection regardless of mode (5000/connection, no Full-mode
+        # penalty), so this trades nothing in capacity for getting OI/bid/ask
+        # on the same free WS feed LTP already rides, instead of needing a
+        # REST round trip (get_broker_rest_quotes/get_broker_rest_depth) for
+        # every chain that isn't already warm.
         for i in range(0, len(security_ids), 100):
             batch = security_ids[i:i + 100]
             msg = json.dumps({
-                "RequestCode":     REQ_TICKER_SUB,
+                "RequestCode":     REQ_FULL_SUB,
                 "InstrumentCount": len(batch),
                 "InstrumentList":  [
                     {"ExchangeSegment": exchange, "SecurityId": sid}
@@ -718,11 +724,15 @@ class _DhanTickerManager:
 
     def _handle_chain_binary(self, data: bytes) -> None:
         """
-        Lightweight binary parse for the chain-feed connection: Ticker packets
-        only (LTP, no OI/depth — this connection runs REQ_TICKER_SUB), writes
-        straight into the shared ltp_map/ltp_ts_map. No dispatch_tick, no
-        listener notification — chain-warming ticks never touch the
-        execution-critical path.
+        Binary parse for the chain-feed connection. Handles RESP_FULL packets
+        (LTP + OI + depth — _send_chain_subscribe now requests REQ_FULL_SUB,
+        not REQ_TICKER_SUB; see the option-chain latency investigation this
+        completes: bid/ask/OI used to be REST-only for every chain token,
+        this puts them on the same free WS feed LTP already used) plus
+        RESP_PREV_CLOSE, writing straight into the shared ltp_map/oi_map/
+        bid_map/ask_map/prev_close_map. No dispatch_tick, no listener
+        notification — chain-warming ticks never touch the execution-critical
+        path, same as before this change; only the packet richness grew.
         """
         now_ts = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
         _EXCH_NSE_FNO = 2
@@ -739,7 +749,7 @@ class _DhanTickerManager:
                 pkt_size = _HDR.size
             offset += pkt_size
 
-            if feed_code != RESP_TICKER:
+            if feed_code not in (RESP_TICKER, RESP_FULL, RESP_PREV_CLOSE):
                 continue
 
             ltp_offset = offset - pkt_size + _HDR.size
@@ -753,12 +763,45 @@ class _DhanTickerManager:
                 continue
 
             sid_str = str(security_id)
+
+            if feed_code == RESP_PREV_CLOSE:
+                self.prev_close_map[sid_str] = ltp_val
+                continue
+
             self.ltp_map[sid_str]    = ltp_val
             self.ltp_ts_map[sid_str] = now_ts
             if exch_seg == _EXCH_NSE_FNO:
                 self.ltp_map["NSE_" + sid_str] = ltp_val
             elif exch_seg == _EXCH_BSE_FNO:
                 self.ltp_map["BSE_" + sid_str] = ltp_val
+
+            if feed_code != RESP_FULL:
+                continue
+
+            # OI at offset 34 (ltp_offset+26) — same layout as the main
+            # connection's _handle_binary.
+            oi_offset = ltp_offset + 26
+            if oi_offset + 4 <= len(data):
+                try:
+                    oi_val = _FULL_OI.unpack_from(data, oi_offset)[0]
+                    if oi_val > 0:
+                        self.oi_map[sid_str] = oi_val
+                except Exception:
+                    pass
+
+            # Market depth level 0 (best bid/ask) at offset 62 (ltp_offset+54)
+            # — see _FULL_DEPTH_L0's docstring for the verified byte layout.
+            depth_offset = ltp_offset + 54
+            if depth_offset + _FULL_DEPTH_L0.size <= len(data):
+                try:
+                    _bid_qty, _ask_qty, _bid_ord, _ask_ord, bid_val, ask_val = \
+                        _FULL_DEPTH_L0.unpack_from(data, depth_offset)
+                    if bid_val > 0:
+                        self.bid_map[sid_str] = bid_val
+                    if ask_val > 0:
+                        self.ask_map[sid_str] = ask_val
+                except Exception:
+                    pass
 
     # ── internal ──────────────────────────────────────────────────────────────
 
@@ -1045,9 +1088,10 @@ class _DhanTickerManager:
 
                 # Market depth level 0 (best bid/ask) at offset 62 (ltp_offset+54) — see
                 # _FULL_DEPTH_L0's docstring for the verified byte layout. Only ever present
-                # on RESP_FULL (F&O option legs, main connection — the chain-warming pool
-                # subscribes Ticker-only and never sends this). Feeds _resolve_mpp_price's
-                # bid/ask directly instead of it falling back to a stale REST-cached value.
+                # on RESP_FULL — both the main connection (F&O option legs) and the
+                # chain-feed pool (_handle_chain_binary mirrors this same parse) now
+                # subscribe REQ_FULL_SUB. Feeds _resolve_mpp_price's bid/ask directly
+                # instead of it falling back to a stale REST-cached value.
                 depth_offset = ltp_offset + 54
                 if depth_offset + _FULL_DEPTH_L0.size <= len(data):
                     try:

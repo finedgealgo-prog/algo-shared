@@ -404,14 +404,21 @@ def _fetch_full_chain_from_dhan(
     # [DHAN CHAIN] quotes print suppressed
 
     # ── 3c. Depth (bid/ask) + previous-day baseline (for oi/ltp change%) ──────
-    # Separate from broker_quotes above: depth never arrives over the WS
-    # ticker (see get_broker_rest_depth's docstring), so it's always a fresh
-    # REST lookup (short-TTL cached there); the previous-day baseline is a
-    # once-per-session Mongo read (long-TTL cached in this module).
+    # WS-first (chain tokens now subscribe REQ_FULL_SUB, same as live
+    # positions — see dhan_ticker.py's _handle_chain_binary): any token
+    # that's actually ticking already has bid/ask/prev_close in
+    # broker_ticker_manager's maps, zero REST, zero rate-gate. Only tokens
+    # genuinely missing from WS (a chain opened this instant, before its
+    # first Full packet arrived) fall back to the REST path below; the
+    # previous-day baseline is a once-per-session Mongo read (long-TTL
+    # cached in this module), unrelated to either.
     broker_depth: dict[str, dict] = {}
     try:
-        from features.broker_gateway import get_broker_rest_depth  # type: ignore
-        broker_depth = get_broker_rest_depth(all_tok_ids, db._db, ws_segments)
+        from features.broker_gateway import get_broker_ws_depth, get_broker_rest_depth  # type: ignore
+        broker_depth = get_broker_ws_depth(all_tok_ids)
+        _missing_depth = [t for t in all_tok_ids if t not in broker_depth]
+        if _missing_depth:
+            broker_depth.update(get_broker_rest_depth(_missing_depth, db._db, ws_segments))
     except Exception as exc:
         log.warning('[DHAN CHAIN] leg=%s broker_depth error: %s', leg_id, exc)
     baseline = _resolve_previous_day_baseline(db._db, str(underlying or '').strip().upper(), expiry)

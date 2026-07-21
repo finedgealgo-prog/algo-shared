@@ -167,6 +167,34 @@ class _LiveFastMonitorSupervisor:
         }
 
     async def _run(self) -> None:
+        # Auto-restart wrapper: _run_once() covers a single trade_date's monitor
+        # loop lifetime. If it dies from an exception that escaped every inner
+        # try/except (see _run_once), don't leave exit-time square-off and entry
+        # processing permanently stopped for the rest of the day — log it and
+        # restart with a short backoff instead.
+        consecutive_failures = 0
+        while self._running:
+            try:
+                await self._run_once()
+            except asyncio.CancelledError:
+                break
+            except Exception as exc:
+                consecutive_failures += 1
+                log.error(
+                    '[LIVE+FF MONITOR] fatal error (restart attempt %d): %s',
+                    consecutive_failures, exc,
+                )
+                if not self._running:
+                    break
+                backoff = min(5.0 * consecutive_failures, 30.0)
+                print(f'[LIVE+FF MONITOR] restarting in {backoff:.0f}s after crash')
+                await asyncio.sleep(backoff)
+                continue
+            # _run_once() only returns normally once self._running is False
+            # (a deliberate stop()) — nothing left to restart.
+            break
+
+    async def _run_once(self) -> None:
         db = MongoData()
         _poll_tick = 0
         try:
@@ -187,15 +215,25 @@ class _LiveFastMonitorSupervisor:
                     ticker_tick_count = 0
                 records_by_mode: dict[str, list[dict[str, Any]]] = {}
                 for activation_mode in SUPPORTED_MODES:
-                    records_by_mode[activation_mode] = _load_mode_records(
-                        db,
-                        self.trade_date,
-                        activation_mode,
+                    try:
+                        records_by_mode[activation_mode] = _load_mode_records(
+                            db,
+                            self.trade_date,
+                            activation_mode,
+                        )
+                    except Exception as exc:
+                        log.warning(
+                            '[LIVE+FF MONITOR] _load_mode_records error mode=%s: %s',
+                            activation_mode, exc,
+                        )
+                        records_by_mode[activation_mode] = []
+                try:
+                    runtime_mode_registry.update(
+                        records_by_mode=records_by_mode,
+                        refreshed_at=now_ts,
                     )
-                runtime_mode_registry.update(
-                    records_by_mode=records_by_mode,
-                    refreshed_at=now_ts,
-                )
+                except Exception as exc:
+                    log.warning('[LIVE+FF MONITOR] registry update error: %s', exc)
                 self.last_tick_at = now_ts
                 try:
                     if records_by_mode.get('live') or records_by_mode.get('fast-forward') or records_by_mode.get('forward-test'):
@@ -211,37 +249,40 @@ class _LiveFastMonitorSupervisor:
                 except Exception as exc:
                     log.warning('[LIVE+FF TOKEN SYNC] error: %s', exc)
                 if SHOW_MONITOR_LOGS:
-                    print(
-                        '[LIVE+FF MONITOR] '
-                        f'trade_date={self.trade_date} '
-                        f'live={len(records_by_mode.get("live") or [])} '
-                        f'fast_forward={len(records_by_mode.get("fast-forward") or [])} '
-                        f'ticker_tick_count={ticker_tick_count}'
-                    )
-                    for activation_mode in SUPPORTED_MODES:
-                        for record in (records_by_mode.get(activation_mode) or []):
-                            _raw_et = str(record.get('entry_time') or '').strip()
-                            _et_hhmm = _raw_et[11:16] if len(_raw_et) >= 16 else _raw_et[:5]
-                            _open = int(record.get('open_legs') or 0)
-                            _total = int(record.get('total_legs') or 0)
-                            if _open > 0:
-                                _entry_status = 'entered'
-                            elif _et_hhmm and current_hhmm and current_hhmm < _et_hhmm:
-                                _entry_status = f'waiting — entry_at={_et_hhmm} now={current_hhmm}'
-                            elif _et_hhmm:
-                                _entry_status = f'ready_to_enter — entry_at={_et_hhmm} now={current_hhmm}'
-                            else:
-                                _entry_status = 'no_entry_time'
-                            print(
-                                '[LIVE+FF CHECK] '
-                                f'mode={activation_mode} '
-                                f'group={str(record.get("group_name") or "-")} '
-                                f'strategy={str(record.get("name") or "-")} '
-                                f'entry_time={_et_hhmm or "--:--"} '
-                                f'current_time={current_hhmm or "--:--"} '
-                                f'legs={_open}/{_total} '
-                                f'status={_entry_status}'
-                            )
+                    try:
+                        print(
+                            '[LIVE+FF MONITOR] '
+                            f'trade_date={self.trade_date} '
+                            f'live={len(records_by_mode.get("live") or [])} '
+                            f'fast_forward={len(records_by_mode.get("fast-forward") or [])} '
+                            f'ticker_tick_count={ticker_tick_count}'
+                        )
+                        for activation_mode in SUPPORTED_MODES:
+                            for record in (records_by_mode.get(activation_mode) or []):
+                                _raw_et = str(record.get('entry_time') or '').strip()
+                                _et_hhmm = _raw_et[11:16] if len(_raw_et) >= 16 else _raw_et[:5]
+                                _open = int(record.get('open_legs') or 0)
+                                _total = int(record.get('total_legs') or 0)
+                                if _open > 0:
+                                    _entry_status = 'entered'
+                                elif _et_hhmm and current_hhmm and current_hhmm < _et_hhmm:
+                                    _entry_status = f'waiting — entry_at={_et_hhmm} now={current_hhmm}'
+                                elif _et_hhmm:
+                                    _entry_status = f'ready_to_enter — entry_at={_et_hhmm} now={current_hhmm}'
+                                else:
+                                    _entry_status = 'no_entry_time'
+                                print(
+                                    '[LIVE+FF CHECK] '
+                                    f'mode={activation_mode} '
+                                    f'group={str(record.get("group_name") or "-")} '
+                                    f'strategy={str(record.get("name") or "-")} '
+                                    f'entry_time={_et_hhmm or "--:--"} '
+                                    f'current_time={current_hhmm or "--:--"} '
+                                    f'legs={_open}/{_total} '
+                                    f'status={_entry_status}'
+                                )
+                    except Exception as exc:
+                        log.debug('[LIVE+FF MONITOR] debug print error: %s', exc)
                 try:
                     live_records = records_by_mode.get('live') or []
                     if live_records:
@@ -293,8 +334,14 @@ class _LiveFastMonitorSupervisor:
                                 sync_open_leg_positions(db)
                             except Exception as _se:
                                 log.debug('[POSITION SYNC] error: %s', _se)
+                except Exception as exc:
+                    # Isolated from the fast-forward/forward-test cycle below so a
+                    # live-path failure (incl. exit-time square-off) can't suppress
+                    # their processing in the same tick.
+                    log.warning('[LIVE AUTO CYCLE] error: %s', exc)
 
-                    for _ff_mode in FAST_FORWARD_LIKE_MODES:
+                for _ff_mode in FAST_FORWARD_LIKE_MODES:
+                    try:
                         ff_mode_records = records_by_mode.get(_ff_mode) or []
                         if not ff_mode_records:
                             continue
@@ -338,8 +385,10 @@ class _LiveFastMonitorSupervisor:
                                 current_hhmm,
                                 now_ts,
                             )
-                except Exception as exc:
-                    log.warning('[FAST-FORWARD QUOTE CYCLE] error: %s', exc)
+                    except Exception as exc:
+                        # Isolated per mode so a fast-forward failure can't
+                        # suppress forward-test's exit-time check, or vice versa.
+                        log.warning('[FAST-FORWARD QUOTE CYCLE] error mode=%s: %s', _ff_mode, exc)
                 # ── Broadcast Kite LTP → update channel (per-user filtered) ──────────
                 # Only send each user the tokens they have subscribed to
                 # (active strategy spot tokens + open leg tokens).
@@ -419,12 +468,10 @@ class _LiveFastMonitorSupervisor:
                     log.debug('[FF LTP EMIT] error: %s', _ltp_exc)
 
                 await asyncio.sleep(0.25)
-        except asyncio.CancelledError:
-            pass
-        except Exception as exc:
-            log.error('[LIVE+FF MONITOR] fatal error: %s', exc)
-            self._running = False
         finally:
+            # Let CancelledError (stop()) and any Exception that escaped every
+            # inner try/except above propagate to the _run() wrapper, which
+            # decides whether to restart — this block only handles cleanup.
             try:
                 db.close()
             except Exception:

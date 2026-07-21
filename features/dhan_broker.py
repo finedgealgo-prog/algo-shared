@@ -23,6 +23,15 @@ log = logging.getLogger(__name__)
 
 _DHAN_API_BASE = 'https://api.dhan.co/v2'
 
+# Module-level, process-wide session — every place_order()/orders()/etc. call reuses its
+# connection pool instead of doing a fresh TCP+TLS handshake to api.dhan.co per request
+# (the plain `requests.post(...)` module-level calls this replaced each opened/closed
+# their own connection). Handshake overhead is a meaningful slice of order-placement
+# latency on a REST call this size, and DhanAdapter itself is re-instantiated per request
+# (see get_dhan_instance) so only a module-level session — not a per-instance one — persists
+# connections across separate order placements.
+_session = requests.Session()
+
 _ORDER_TYPE_TO_DHAN = {'LIMIT': 'LIMIT', 'MARKET': 'MARKET', 'SL': 'STOP_LOSS', 'SL-M': 'STOP_LOSS_MARKET'}
 
 # Dhan orderStatus → Kite-shaped status used by poll_pending_order_fills()/live_order_manager.py.
@@ -34,6 +43,14 @@ _DHAN_STATUS_TO_KITE = {
     'PART_TRADED': 'OPEN',
     'PENDING': 'OPEN',
     'TRANSIT': 'OPEN',
+}
+
+# Dhan orderType → display label for the Orderbook UI.
+_DHAN_ORDER_TYPE_DISPLAY = {
+    'LIMIT': 'Limit',
+    'MARKET': 'Market',
+    'STOP_LOSS': 'SL',
+    'STOP_LOSS_MARKET': 'SL-M',
 }
 
 
@@ -112,7 +129,7 @@ class DhanAdapter:
         }
         print(f'[DHAN PLACE_ORDER] payload={payload}', flush=True)
 
-        resp = requests.post(f'{_DHAN_API_BASE}/orders', json=payload, headers=self._headers(), timeout=10)
+        resp = _session.post(f'{_DHAN_API_BASE}/orders', json=payload, headers=self._headers(), timeout=10)
         print(f'[DHAN PLACE_ORDER] response status={resp.status_code} body={resp.text[:500]}', flush=True)
         if resp.status_code not in (200, 201):
             raise Exception(f'Dhan PlaceOrder failed: HTTP {resp.status_code} {resp.text[:300]}')
@@ -122,7 +139,7 @@ class DhanAdapter:
     # ── cancel_order ─────────────────────────────────────────────────────────
 
     def cancel_order(self, variety: str = 'regular', order_id: str = '') -> str:
-        resp = requests.delete(f'{_DHAN_API_BASE}/orders/{order_id}', headers=self._headers(), timeout=10)
+        resp = _session.delete(f'{_DHAN_API_BASE}/orders/{order_id}', headers=self._headers(), timeout=10)
         if resp.status_code not in (200, 202):
             raise Exception(f'Dhan CancelOrder failed: HTTP {resp.status_code} {resp.text[:300]}')
         return order_id
@@ -158,7 +175,7 @@ class DhanAdapter:
         }
         if quantity is not None:
             payload['quantity'] = int(quantity)
-        resp = requests.put(f'{_DHAN_API_BASE}/orders/{order_id}', json=payload, headers=self._headers(), timeout=10)
+        resp = _session.put(f'{_DHAN_API_BASE}/orders/{order_id}', json=payload, headers=self._headers(), timeout=10)
         if resp.status_code not in (200, 202):
             raise Exception(f'Dhan ModifyOrder failed: HTTP {resp.status_code} {resp.text[:300]}')
         data = resp.json() if resp.text else {}
@@ -169,7 +186,7 @@ class DhanAdapter:
     def orders(self) -> list:
         """Return order book as list of Kite-shaped dicts. Unverified — see module docstring."""
         try:
-            resp = requests.get(f'{_DHAN_API_BASE}/orders', headers=self._headers(), timeout=10)
+            resp = _session.get(f'{_DHAN_API_BASE}/orders', headers=self._headers(), timeout=10)
         except Exception as exc:
             log.error('Dhan orders() request error: %s', exc)
             return []
@@ -198,11 +215,23 @@ class DhanAdapter:
                 'quantity': int(o.get('quantity') or 0),
                 'tradingsymbol': str(o.get('tradingSymbol') or ''),
                 'exchange': str(o.get('exchangeSegment') or ''),
+                # security_id + exchange (already exchangeSegment above) are what
+                # /trade/positions/repeat-order needs to re-place this exact contract
+                # via Dhan's live feed (see _fetch_dhan_market_data) without re-parsing
+                # underlying/expiry/strike out of tradingSymbol — Dhan's own tradingSymbol
+                # doesn't reliably encode which week's contract it is (see _resolve_security's
+                # docstring above), but securityId always identifies the exact instrument.
+                'security_id': str(o.get('securityId') or ''),
                 'transaction_type': str(o.get('transactionType') or ''),
                 'product': 'MIS' if str(o.get('productType') or '').upper() == 'INTRADAY' else 'NRML',
                 'last_price': float(o.get('averageTradedPrice') or o.get('price') or 0),
                 'status_message': str(o.get('omsErrorDescription') or ''),
                 'status_message_raw': str(o.get('omsErrorDescription') or ''),
+                'order_type': _DHAN_ORDER_TYPE_DISPLAY.get(str(o.get('orderType') or '').upper(), str(o.get('orderType') or '')),
+                # createTime is Dhan's "order placed at" timestamp (documented format
+                # "YYYY-MM-DD HH:MM:SS"); updateTime is its last-activity fallback for
+                # older orders whose createTime Dhan sometimes omits.
+                'order_time': str(o.get('createTime') or o.get('updateTime') or ''),
             })
         return out
 

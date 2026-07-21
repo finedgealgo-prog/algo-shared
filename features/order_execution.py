@@ -77,6 +77,7 @@ def place_broker_order(
     validity: str = 'DAY',
     context: dict | None = None,
     broker_kwargs: dict | None = None,
+    check_status: bool = True,
 ) -> dict:
     """
     Returns {"order_id": str, "status": "success"|"error", "message": str, "raw": Any}.
@@ -84,6 +85,14 @@ def place_broker_order(
     reported back as status="error" instead. Fires a Telegram notification to the
     user on any failure (order-execution failures are the trader's money, not a
     backend bug, so they go to the user bucket — see telegram_notifier.py).
+
+    check_status=False skips the post-placement broker.orders() call below —
+    a second full order-book REST round trip per leg, on top of place_order()'s
+    own. Callers where a human is waiting on the response (e.g. the Order Pad)
+    should pass False for near-instant placement; broker_status just comes back
+    "UNKNOWN" and the real fill status is picked up later via the normal
+    positions/order-book refresh. Live entry/exit and the SL/TP monitor keep the
+    default (True) since they act on broker_status immediately.
 
     broker_kwargs: opaque extra kwargs forwarded verbatim to broker.place_order() —
     this function stays broker-agnostic on purpose and must never name a specific
@@ -135,18 +144,19 @@ def place_broker_order(
     # the placement already succeeded; a status-check hiccup shouldn't overturn that.
     broker_status = 'UNKNOWN'
     broker_status_detail: dict = {}
-    try:
-        book = broker.orders()
-        match = next((o for o in book if str(o.get('order_id') or '') == order_id), None)
-        if match:
-            broker_status = str(match.get('status') or 'UNKNOWN').upper()
-            broker_status_detail = {
-                'average_price': match.get('average_price'),
-                'filled_quantity': match.get('filled_quantity'),
-                'status_message': match.get('status_message') or '',
-            }
-    except Exception as exc:
-        log.debug('[ORDER STATUS CHECK] failed order_id=%s: %s', order_id, exc)
+    if check_status:
+        try:
+            book = broker.orders()
+            match = next((o for o in book if str(o.get('order_id') or '') == order_id), None)
+            if match:
+                broker_status = str(match.get('status') or 'UNKNOWN').upper()
+                broker_status_detail = {
+                    'average_price': match.get('average_price'),
+                    'filled_quantity': match.get('filled_quantity'),
+                    'status_message': match.get('status_message') or '',
+                }
+        except Exception as exc:
+            log.debug('[ORDER STATUS CHECK] failed order_id=%s: %s', order_id, exc)
 
     if broker_status == 'REJECTED':
         message = str(broker_status_detail.get('status_message') or 'Order rejected by broker after placement.')

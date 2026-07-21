@@ -261,32 +261,69 @@ _LAST_GOOD_QUOTE: dict[str, dict] = {}
 # live-quote WS's background refresh loop) got 429'd consistently. Every
 # caller now funnels through dhan_quote_post() so the whole app shares one
 # clock instead of each call site guessing with its own ad-hoc sleep.
-_DHAN_QUOTE_LOCK = threading.Lock()
-_dhan_quote_last_call_at = 0.0
+#
+# That fix held while everything ran as one process. It's since been split
+# into 5 separate services (algo.trade/simulator/scanner/websocket/order),
+# each its own OS process importing this same file — a threading.Lock/module
+# global only serializes calls *within* one process, so each service quietly
+# went back to pacing itself to ~1 req/sec independently. Five processes each
+# doing that still blow past Dhan's real per-account limit combined, so the
+# exact 429 storm this comment describes came back (confirmed live 2026-07-16:
+# a place-order call 429'd with "Too many requests" while other services were
+# also polling quotes). The clock itself now lives in Mongo — the one thing
+# every service already shares — instead of a process-local variable, so the
+# pacing is global across all 5 processes again, not just within each one.
 _DHAN_QUOTE_MIN_INTERVAL = 1.05  # seconds
+_DHAN_QUOTE_GATE_COLLECTION = "dhan_quote_rate_gate"
+_DHAN_QUOTE_GATE_ID = "clock"
+
+
+def _claim_dhan_slot(min_interval: float) -> tuple[bool, float]:
+    """
+    Attempt to atomically claim the next Dhan quote slot against the shared
+    Mongo-backed clock. Returns (claimed, last_call_at) — last_call_at is this
+    call's own claim time if claimed, otherwise whichever process currently
+    holds the most recent slot (so the caller can compute an exact retry wait
+    instead of busy-polling on a fixed interval).
+    """
+    from features.mongo_data import MongoData  # type: ignore
+
+    now = time.time()
+    coll = MongoData()._db[_DHAN_QUOTE_GATE_COLLECTION]
+    updated = coll.find_one_and_update(
+        {"_id": _DHAN_QUOTE_GATE_ID, "last_call_at": {"$lte": now - min_interval}},
+        {"$set": {"last_call_at": now}},
+    )
+    if updated is not None:
+        return True, now
+    try:
+        coll.insert_one({"_id": _DHAN_QUOTE_GATE_ID, "last_call_at": now})
+        return True, now
+    except Exception:
+        pass  # doc already exists (this call or another process lost the race) — fall through
+    existing = coll.find_one({"_id": _DHAN_QUOTE_GATE_ID}, {"last_call_at": 1})
+    return False, float((existing or {}).get("last_call_at") or now)
 
 
 def wait_for_dhan_slot(min_interval: float = _DHAN_QUOTE_MIN_INTERVAL) -> None:
     """
-    Block until the shared Dhan rate-gate clock has a free slot, then claim it.
+    Block until the shared Dhan rate-gate clock (Mongo-backed, cross-process —
+    see _claim_dhan_slot) has a free slot, then claim it.
 
-    Same lock/clock as dhan_quote_post() above, but blocking instead of
+    Same clock as dhan_quote_post() above, but blocking instead of
     skip-on-miss — for callers that need the call to eventually succeed
     (e.g. historical-data backfills) rather than callers that are fine
     falling back to a cached value (live quote polling). Use this so
     non-quote Dhan REST calls line up on the *same* clock as the quote
     pollers instead of running their own independent sleep() and 429-ing
-    each other, which is the exact failure mode this lock was built for.
+    each other, which is the exact failure mode this gate was built for.
     """
-    global _dhan_quote_last_call_at
     while True:
-        with _DHAN_QUOTE_LOCK:
-            now = time.monotonic()
-            remaining = min_interval - (now - _dhan_quote_last_call_at)
-            if remaining <= 0:
-                _dhan_quote_last_call_at = now
-                return
-        time.sleep(remaining)
+        claimed, last_call_at = _claim_dhan_slot(min_interval)
+        if claimed:
+            return
+        remaining = min_interval - (time.time() - last_call_at)
+        time.sleep(max(remaining, 0.02))
 
 
 def _dhan_quote_http(req_body: dict, access_token: str, client_id: str, timeout: float):
@@ -307,19 +344,16 @@ def _dhan_quote_http(req_body: dict, access_token: str, client_id: str, timeout:
 def dhan_quote_post(req_body: dict, access_token: str, client_id: str, timeout: float = 15.0):
     """
     POST to Dhan's /v2/marketfeed/quote, globally throttled across every
-    caller in this process. Returns None (never raises, never blocks) if
-    called too soon after the last call anywhere in the app — callers
-    already fall back to their own last-good cache for that case, which
-    costs nothing and is strictly better than burning the shared rate-limit
-    budget on a call likely to 429 anyway.
+    caller in every service (see _claim_dhan_slot — the clock is Mongo-backed,
+    not process-local). Returns None (never raises, never blocks) if called
+    too soon after the last call anywhere in the app — callers already fall
+    back to their own last-good cache for that case, which costs nothing and
+    is strictly better than burning the shared rate-limit budget on a call
+    likely to 429 anyway.
     """
-    global _dhan_quote_last_call_at
-    with _DHAN_QUOTE_LOCK:
-        now = time.monotonic()
-        if now - _dhan_quote_last_call_at < _DHAN_QUOTE_MIN_INTERVAL:
-            return None
-        _dhan_quote_last_call_at = now
-
+    claimed, _ = _claim_dhan_slot(_DHAN_QUOTE_MIN_INTERVAL)
+    if not claimed:
+        return None
     return _dhan_quote_http(req_body, access_token, client_id, timeout)
 
 
@@ -563,6 +597,26 @@ def get_broker_rest_quotes(
                             _REST_QUOTE_CACHE[_key] = (_rest_epoch, entry)
                             if entry["ltp"] > 0:
                                 _LAST_GOOD_QUOTE[_key] = entry
+                        # Dhan's /marketfeed/quote response already carries depth + ohlc.close
+                        # for every token in this same payload — get_broker_rest_depth wants
+                        # exactly that (bid/ask/prev_close), and used to always fire its own
+                        # second identical REST call (same endpoint, same token batch, same
+                        # rate-gate slot) just to re-fetch what this call already received and
+                        # discarded. Stashing it into the same _REST_DEPTH_CACHE that function
+                        # already checks first means a depth call landing within
+                        # _REST_DEPTH_CACHE_TTL of this one (the normal case — both fire back to
+                        # back inside the same _fetch_full_chain_from_dhan pass) now finds a warm
+                        # cache and skips its REST round trip + rate-gate wait entirely.
+                        _depth_block = v.get("depth") or {}
+                        _buy_levels = _depth_block.get("buy") or []
+                        _sell_levels = _depth_block.get("sell") or []
+                        _depth_entry = {
+                            "bid": float((_buy_levels[0] or {}).get("price") or 0) if _buy_levels else 0.0,
+                            "ask": float((_sell_levels[0] or {}).get("price") or 0) if _sell_levels else 0.0,
+                            "prev_close": float((v.get("ohlc") or {}).get("close") or 0),
+                        }
+                        for _key in (tok_str, _numeric_to_original.get(tok_str, tok_str)):
+                            _REST_DEPTH_CACHE[_key] = (_rest_epoch, _depth_entry)
             else:
                 # Most commonly a 429 — Dhan rate-limits /marketfeed/quote to
                 # roughly 1 req/sec per account, and any other open page/tab
@@ -596,6 +650,88 @@ def get_broker_rest_quotes(
 _REST_DEPTH_CACHE: dict[str, tuple[float, dict]] = {}  # token → (epoch, {"bid","ask","prev_close"})
 _REST_DEPTH_CACHE_TTL = 3.0  # seconds — matches _REST_QUOTE_CACHE_TTL / dhan rate gate cadence
 
+# Tokens currently being fetched by a background depth thread (see
+# get_broker_rest_depth). Without this, every caller that misses the depth
+# cache spawns its own background fetch for the same tokens — under the
+# live-greeks-chain WS broadcaster's own 2s poll cadence (shorter than the 3s
+# depth cache TTL, so it almost always misses), that's a new redundant thread
+# queuing on the shared 1 req/sec Dhan rate gate every ~2s, each one further
+# delaying every other one instead of the fetch converging. This dedupes so
+# only the first caller for a given batch of tokens actually fetches; anyone
+# else just gets 0/last-cached until that fetch lands.
+_DEPTH_FETCH_INFLIGHT: set[str] = set()
+_DEPTH_FETCH_INFLIGHT_LOCK = threading.Lock()
+
+
+def _apply_dhan_depth_response(resp, req_body: dict, numeric_to_original: dict[str, str]) -> None:
+    """Parse a Dhan /marketfeed/quote response into _REST_DEPTH_CACHE — shared by
+    get_broker_rest_depth's sync path (cache already warm) and its async
+    background-fetch path (see get_broker_rest_depth's docstring)."""
+    if resp is None or resp.status_code != 200:
+        return
+    raw = resp.json()
+    data = raw.get("data") or raw
+    _epoch = time.time()
+    for exch in req_body.keys():
+        for tok, v in (data.get(exch) or {}).items():
+            if not isinstance(v, dict):
+                continue
+            depth = v.get("depth") or {}
+            buy_levels = depth.get("buy") or []
+            sell_levels = depth.get("sell") or []
+            bid = float((buy_levels[0] or {}).get("price") or 0) if buy_levels else 0.0
+            ask = float((sell_levels[0] or {}).get("price") or 0) if sell_levels else 0.0
+            prev_close = float((v.get("ohlc") or {}).get("close") or 0)
+            tok_str = str(tok)
+            entry = {"bid": bid, "ask": ask, "prev_close": prev_close}
+            for _key in (tok_str, numeric_to_original.get(tok_str, tok_str)):
+                _REST_DEPTH_CACHE[_key] = (_epoch, entry)
+
+
+def _fetch_dhan_depth_async(
+    req_body: dict,
+    access_token: str,
+    client_id: str,
+    numeric_to_original: dict[str, str],
+    inflight_keys: list[str],
+) -> None:
+    """Background-thread body for get_broker_rest_depth's cache-miss case — waits
+    for the shared rate-gate slot and fetches, off the request thread."""
+    try:
+        resp = dhan_quote_post_blocking(req_body, access_token, client_id, timeout=10.0)
+        _apply_dhan_depth_response(resp, req_body, numeric_to_original)
+    except Exception as exc:
+        import logging
+        logging.getLogger(__name__).warning("[BROKER REST DEPTH async] %s", exc)
+    finally:
+        with _DEPTH_FETCH_INFLIGHT_LOCK:
+            _DEPTH_FETCH_INFLIGHT.difference_update(inflight_keys)
+
+
+def get_broker_ws_depth(token_ids: list[str]) -> dict[str, dict]:
+    """
+    WS-first depth lookup — {token_str: {"bid", "ask", "prev_close"}} straight
+    from broker_ticker_manager's bid_map/ask_map/prev_close_map, no REST, no
+    rate gate. Populated by dhan_ticker.py's _handle_binary (main/live-position
+    connection) and _handle_chain_binary (chain-feed pool — as of the
+    option-chain latency fix, both subscribe REQ_FULL_SUB, so any token
+    that's actually ticking has this in-memory, same as ltp_map already does
+    for LTP). Returns only tokens with a real bid or ask present; callers
+    should fall back to get_broker_rest_depth for whatever's missing (a chain
+    that's only been open a moment, before its first Full packet lands).
+    """
+    if _active_broker() != 'dhan':
+        return {}
+    _dtm = broker_ticker_manager
+    ws_bid, ws_ask, ws_prev_close = _dtm.bid_map, _dtm.ask_map, _dtm.prev_close_map
+    result: dict[str, dict] = {}
+    for t in token_ids:
+        bid = float(ws_bid.get(t) or 0)
+        ask = float(ws_ask.get(t) or 0)
+        if bid > 0 or ask > 0:
+            result[t] = {"bid": bid, "ask": ask, "prev_close": float(ws_prev_close.get(t) or 0)}
+    return result
+
 
 def get_broker_rest_depth(
     token_ids: list[str],
@@ -603,20 +739,30 @@ def get_broker_rest_depth(
     ws_segments: dict[str, str] | None = None,
 ) -> dict[str, dict]:
     """
-    Return {token_str: {"bid": float, "ask": float, "prev_close": float}} —
-    top-of-book depth + previous day's close premium, sourced from Dhan's
-    REST /marketfeed/quote. This is the only place this app ever sees depth —
-    the binary WS feed parsed in dhan_ticker.py's _handle_binary only decodes
-    LTP/OI from the Full packet, never its depth block, so depth can't come
-    from ws_ltp/ws_oi the way get_broker_rest_quotes' LTP does.
+    REST fallback for {token_str: {"bid": float, "ask": float, "prev_close":
+    float}} — top-of-book depth + previous day's close premium. The option-
+    chain warming pool now subscribes REQ_FULL_SUB (see dhan_ticker.py's
+    _send_chain_subscribe and _handle_chain_binary), so for any token that's
+    actually flowing ticks, bid/ask/prev_close already live in
+    broker_ticker_manager.bid_map/ask_map/prev_close_map — check those FIRST
+    (same WS-first pattern get_broker_rest_quotes already uses for LTP/OI).
+    This function is the fallback for tokens that aren't there yet: a chain
+    just opened this second, before its first Full packet has arrived.
     Kite: returns {} — no depth wiring for that broker yet.
 
-    Every call fetches fresh for tokens not already cached (no WS shortcut,
-    unlike get_broker_rest_quotes) — but every token is cached for
-    _REST_DEPTH_CACHE_TTL so repeat callers within the same short window
-    (the live-greeks-chain broadcaster polls every 2s per open chain) share
-    one Dhan REST round trip instead of one each, respecting the same
-    dhan_quote_post() rate gate every other REST caller in this file uses.
+    Cache hits return synchronously as before. A cache MISS no longer blocks
+    the caller on Dhan's REST round trip (rate-gate wait + ~300-550ms HTTP,
+    was the single biggest chunk of /live-greeks-chain's cold-chain latency —
+    see the option-chain latency investigation this fixes) — it now returns
+    whatever's cached (0 for a token nobody's ever fetched depth for) and
+    kicks the fetch off in a background thread instead. This is safe
+    specifically *because* get_broker_rest_depth has exactly one caller
+    (_fetch_full_chain_from_dhan, a read-only chain display) and depth is
+    purely cosmetic (bid/ask columns) — nothing here gates order placement
+    the way get_broker_rest_quotes' LTP does, so a token showing bid=ask=0 for
+    one push cycle is an acceptable trade for an instant response; the next
+    live-greeks-chain WS push (~2s later, see live_greeks_chain_socket.py)
+    picks up the now-warm cache same as any other refresh.
     """
     if _active_broker() != 'dhan':
         return {}
@@ -633,6 +779,16 @@ def get_broker_rest_depth(
     if not missing:
         return result
 
+    # Only fetch tokens no other in-flight background thread is already
+    # fetching (see _DEPTH_FETCH_INFLIGHT's docstring) — everyone else just
+    # gets 0/last-cached for this pass and picks up the real value once that
+    # fetch lands and populates _REST_DEPTH_CACHE.
+    with _DEPTH_FETCH_INFLIGHT_LOCK:
+        to_fetch = [t for t in missing if t not in _DEPTH_FETCH_INFLIGHT]
+        _DEPTH_FETCH_INFLIGHT.update(to_fetch)
+    if not to_fetch:
+        return result
+
     _segs = ws_segments or {}
 
     def _to_int(tok: str) -> int | None:
@@ -643,12 +799,12 @@ def get_broker_rest_depth(
             return None
 
     _numeric_to_original: dict[str, str] = {}
-    for t in missing:
+    for t in to_fetch:
         n = t.split("_", 1)[-1] if "_" in t else t
         _numeric_to_original.setdefault(n, t)
 
     missing_by_segment: dict[str, list[str]] = {}
-    for t in missing:
+    for t in to_fetch:
         missing_by_segment.setdefault(_segs.get(t, "NSE_FNO").upper(), []).append(t)
 
     try:
@@ -656,6 +812,8 @@ def get_broker_rest_depth(
         access_token = str(cfg.get("access_token") or "").strip()
         client_id    = str(cfg.get("user_id") or cfg.get("dhan_client_id") or "").strip()
         if not access_token:
+            with _DEPTH_FETCH_INFLIGHT_LOCK:
+                _DEPTH_FETCH_INFLIGHT.difference_update(to_fetch)
             return result
 
         # Dhan caps /marketfeed/quote at ~1000 ids per segment per request —
@@ -665,6 +823,10 @@ def get_broker_rest_depth(
         _num_batches = (_max_len + _BATCH - 1) // _BATCH if _max_len else 0
 
         for _batch_idx in range(_num_batches):
+            batch_original_ids: list[str] = [
+                t for ids in missing_by_segment.values()
+                for t in ids[_batch_idx * _BATCH:(_batch_idx + 1) * _BATCH]
+            ]
             req_body: dict = {
                 segment: [
                     v for t in ids[_batch_idx * _BATCH:(_batch_idx + 1) * _BATCH]
@@ -674,40 +836,21 @@ def get_broker_rest_depth(
             }
             req_body = {segment: ids for segment, ids in req_body.items() if ids}
             if not req_body:
+                with _DEPTH_FETCH_INFLIGHT_LOCK:
+                    _DEPTH_FETCH_INFLIGHT.difference_update(batch_original_ids)
                 continue
 
-            # _blocking, not the skip-if-busy dhan_quote_post used above: this
-            # call always fires microseconds after get_broker_rest_quotes'
-            # own dhan_quote_post within the same _fetch_full_chain_from_dhan
-            # pass, i.e. always inside the other call's 1.05s gate window —
-            # skipping here would mean depth silently never resolves. Same
-            # fix dhan_quote_post_blocking's docstring already describes for
-            # fetch_full_chain's own back-to-back spot+chain calls.
-            resp = dhan_quote_post_blocking(req_body, access_token, client_id, timeout=10.0)
-            if resp.status_code != 200:
-                continue
-
-            raw = resp.json()
-            data = raw.get("data") or raw
-            _epoch = time.time()
-            for exch in req_body.keys():
-                for tok, v in (data.get(exch) or {}).items():
-                    if not isinstance(v, dict):
-                        continue
-                    depth = v.get("depth") or {}
-                    buy_levels = depth.get("buy") or []
-                    sell_levels = depth.get("sell") or []
-                    bid = float((buy_levels[0] or {}).get("price") or 0) if buy_levels else 0.0
-                    ask = float((sell_levels[0] or {}).get("price") or 0) if sell_levels else 0.0
-                    prev_close = float((v.get("ohlc") or {}).get("close") or 0)
-                    tok_str = str(tok)
-                    entry = {"bid": bid, "ask": ask, "prev_close": prev_close}
-                    for _key in (tok_str, _numeric_to_original.get(tok_str, tok_str)):
-                        result[_key] = entry
-                        _REST_DEPTH_CACHE[_key] = (_epoch, entry)
+            threading.Thread(
+                target=_fetch_dhan_depth_async,
+                args=(req_body, access_token, client_id, _numeric_to_original, batch_original_ids),
+                daemon=True,
+                name="dhan_depth_fetch",
+            ).start()
     except Exception as exc:
         import logging
         logging.getLogger(__name__).warning("[BROKER REST DEPTH] %s", exc)
+        with _DEPTH_FETCH_INFLIGHT_LOCK:
+            _DEPTH_FETCH_INFLIGHT.difference_update(to_fetch)
 
     return result
 

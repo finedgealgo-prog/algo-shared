@@ -32,6 +32,12 @@ from typing import Any
 # ── Log directory (relative to this file → backend/logs/) ─────────────────────
 _LOG_DIR = Path(__file__).resolve().parent.parent / "logs"
 
+# ── Master switch ──────────────────────────────────────────────────────────
+# True  → file/console logging enabled as usual.
+# False → logging disabled (no handlers, nothing written) — log files were
+#         growing ~300MB, so keep this False by default.
+LOGGING_ENABLED = False
+
 # ── Module-level DB activity logger ───────────────────────────────────────────
 _db_log = logging.getLogger("db_activity")
 
@@ -40,7 +46,20 @@ def setup_logging() -> None:
     """
     Call once at app startup.
     Configures root logger + db_activity logger with file + console handlers.
+    No-op (logging disabled) when LOGGING_ENABLED is False.
     """
+    root = logging.getLogger()
+    if root.handlers:
+        root.handlers.clear()
+
+    if not LOGGING_ENABLED:
+        root.addHandler(logging.NullHandler())
+        root.setLevel(logging.CRITICAL + 1)
+        _db_log.addHandler(logging.NullHandler())
+        _db_log.setLevel(logging.CRITICAL + 1)
+        _db_log.propagate = False
+        return
+
     _LOG_DIR.mkdir(parents=True, exist_ok=True)
 
     fmt = logging.Formatter(
@@ -87,9 +106,6 @@ def setup_logging() -> None:
     console_handler.setFormatter(fmt)
 
     # ── Root logger ───────────────────────────────────────────────────────────
-    root = logging.getLogger()
-    if root.handlers:
-        root.handlers.clear()
     root.setLevel(logging.DEBUG)
     root.addHandler(app_handler)
     root.addHandler(err_handler)

@@ -25,6 +25,7 @@ from time import perf_counter
 from typing import Any
 
 from bson import ObjectId
+from concurrent.futures import ThreadPoolExecutor
 from fastapi import APIRouter, HTTPException, Query, WebSocket, WebSocketDisconnect
 from pymongo import DESCENDING
 
@@ -1237,6 +1238,19 @@ def _decorate_entry_trade_lifecycle(
     return payload
 
 
+# Exit-order dispatch is the only broker network call in the SL/TP hit path,
+# and close_leg_in_db() has already committed the close in Mongo (exit_trade
+# set, leg excluded from the next tick's open-legs load) before this is even
+# invoked — nothing downstream reads this call's result. Running the broker
+# round-trip inline would block live_tick_dispatcher's single live worker
+# thread, so one strategy's slow order delays every other live strategy's
+# SL/TP check for that same tick. A small dedicated pool lets the tick loop
+# move on immediately while still processing each leg's cancel-then-place
+# atomically (both stay inside one submitted task, so ordering per leg is
+# unaffected).
+_EXIT_ORDER_EXECUTOR = ThreadPoolExecutor(max_workers=8, thread_name_prefix='live_exit_order')
+
+
 def _dispatch_mode_exit_order(
     db: MongoData,
     trade: dict,
@@ -1249,12 +1263,28 @@ def _dispatch_mode_exit_order(
 ) -> None:
     """
     Trigger mode-specific exit-order side effects without branching the shared
-    close-leg DB flow.
+    close-leg DB flow. Live orders are dispatched off-thread — see
+    _EXIT_ORDER_EXECUTOR comment above.
     """
     activation_mode = str(trade.get('activation_mode') or '').strip()
     if activation_mode != 'live' or not symbol or quantity <= 0:
         return
+    _EXIT_ORDER_EXECUTOR.submit(
+        _dispatch_live_exit_order_sync, db, trade, leg, leg_cfg, symbol, quantity, exit_price, exit_reason,
+    )
 
+
+def _dispatch_live_exit_order_sync(
+    db: MongoData,
+    trade: dict,
+    leg: dict,
+    leg_cfg: dict,
+    symbol: str,
+    quantity: int,
+    exit_price: float,
+    exit_reason: str,
+) -> None:
+    """Runs on _EXIT_ORDER_EXECUTOR — the actual broker cancel+place work for one leg exit."""
     leg_id = str(leg.get('id') or '')
     try:
         from features.live_order_manager import (
@@ -4277,6 +4307,42 @@ def _process_momentum_pending_feature_legs(
     return entered_ids
 
 
+def _reentry_budget_remaining(db: MongoData, trade: dict, triggered_by: str, configured_count: int) -> int:
+    """
+    How many more Immediate/AtCost/LikeOriginal reentries this specific leg
+    lineage is still allowed.
+
+    _resolve_leg_cfg() always walks a reentry leg's config back to the
+    original static ListOfLegConfigs entry (so SL/Target/Trail keep applying
+    correctly) — which means `configured_count` (freshly read from that
+    static config) is the SAME value on every generation, no matter how many
+    times this lineage has already re-entered. Gating on it directly would
+    make reentries effectively unbounded.
+
+    Each reentry leg stores its own `reentry_count_remaining` (decremented
+    from its parent's budget) when it's created. Reading the CLOSING leg's
+    own remaining budget — rather than re-deriving it from the static config
+    — is what actually enforces the configured cap across generations. If
+    the closing leg has no such field, it's the original (never-reentered)
+    leg, so the full configured count is its starting budget.
+    """
+    closing_leg = next(
+        (l for l in (trade.get('legs') or [])
+         if isinstance(l, dict) and str(l.get('id') or '') == triggered_by),
+        None,
+    )
+    if closing_leg is None:
+        try:
+            closing_leg = db._db['algo_trade_positions_history'].find_one(
+                {'trade_id': str(trade.get('_id') or ''), 'leg_id': triggered_by},
+            )
+        except Exception:
+            closing_leg = None
+    if closing_leg is not None and closing_leg.get('reentry_count_remaining') is not None:
+        return _safe_int(closing_leg.get('reentry_count_remaining'))
+    return configured_count
+
+
 def _handle_reentry(db: MongoData, trade: dict, leg_config: dict,
                      reentry_config: dict, triggered_by: str, now_ts: str) -> str | None:
     """
@@ -4351,6 +4417,7 @@ def _handle_reentry(db: MongoData, trade: dict, leg_config: dict,
     # ── Immediate → re-enter same leg ASAP ────────────────────────────────────
     if 'Immediate' in reentry_type:
         count = _safe_int((reentry_value or {}).get('ReentryCount') if isinstance(reentry_value, dict) else reentry_value)
+        count = _reentry_budget_remaining(db, trade, triggered_by, count)
         if count <= 0:
             return None
         orig_id = str(leg_config.get('id') or triggered_by)
@@ -4380,13 +4447,16 @@ def _handle_reentry(db: MongoData, trade: dict, leg_config: dict,
 
     # ── AtCost → wait for price to come back to entry cost ────────────────────
     if 'AtCost' in reentry_type:
+        _rc_count = _safe_int((reentry_value or {}).get('ReentryCount') if isinstance(reentry_value, dict) else reentry_value)
+        _rc_count = _reentry_budget_remaining(db, trade, triggered_by, _rc_count)
+        if _rc_count <= 0:
+            return None
         orig_id = str(leg_config.get('id') or triggered_by)
         reentry_id = f'{orig_id}_re_{now_ts.replace(":", "").replace("T", "")}'
         reentry_count = _count_child_legs(trade, triggered_by, is_lazy=False)
         leg_type = f'{parent_leg_type}-reentry_{reentry_count + 1}' if parent_leg_type else f'reentry_{reentry_count + 1}'
         new_leg = _build_pending_leg(reentry_id, leg_config, trade, now_ts, triggered_by, leg_type=leg_type)
         new_leg['reentry_type'] = 'AtCost'
-        _rc_count = _safe_int((reentry_value or {}).get('ReentryCount') if isinstance(reentry_value, dict) else reentry_value)
         new_leg['reentry_count_remaining'] = max(0, _rc_count - 1)
         # AtCost must skip LegMomentum gate — it uses its own cost price check instead.
         new_leg['skip_momentum_check'] = True
@@ -4446,6 +4516,7 @@ def _handle_reentry(db: MongoData, trade: dict, leg_config: dict,
     # ── LikeOriginal (Momentum) ────────────────────────────────────────────────
     if 'LikeOriginal' in reentry_type:
         count = _safe_int(reentry_value)
+        count = _reentry_budget_remaining(db, trade, triggered_by, count)
         if count <= 0:
             return None
         orig_id = str(leg_config.get('id') or triggered_by)
@@ -6578,6 +6649,25 @@ def _latest_trading_day(raw_db, today: str) -> str:
     return today[:10]
 
 
+# Dhan IDX_I security ids — module level since both _fetch_dhan_index_quotes'
+# quote fetch and _dhan_daily_close's historical-candle fallback need the same
+# mapping; used to live as a dict local to _fetch_dhan_index_quotes alone.
+DHAN_INDEX_SECURITY_IDS = {
+    'NIFTY': '13',
+    'BANKNIFTY': '25',
+    'FINNIFTY': '27',
+    'SENSEX': '51',
+    'MIDCPNIFTY': '11915',
+    'BANKEX': '69',
+    # Same Dhan IDX_I security id kite_ticker.py/dhan_ticker.py/broker_gateway.py
+    # already use for VIX elsewhere (BROKER_VIX_TOKEN's dhan branch) — routed
+    # through this same batched quote + option_chain_index_spot prev-close
+    # lookup so the ticker bar's VIX tile gets change_pct/change_points too,
+    # not just a bare LTP (option_chain_index_spot rows tag VIX as 'INDIAVIX').
+    'INDIAVIX': '20225',
+}
+
+
 def _previous_session_close(col, underlying: str, today: str) -> float:
     """
     The most recent prior TRADING day's close for `underlying`, anchored to
@@ -6630,15 +6720,60 @@ def _previous_session_close(col, underlying: str, today: str) -> float:
         )
         if close_doc:
             return _safe_float(close_doc.get('spot_price'))
-        # No tick landed in the post-close window that day (sparse feed for this
-        # underlying) — fall back to whatever's chronologically latest that day
-        # rather than treating it as a non-trading day and stepping past it.
+        # No tick landed in the post-close window that day — most often because this
+        # process (or whatever fed option_chain_index_spot) simply wasn't running
+        # through market close that day, common on a dev box that isn't up 24/7, not
+        # just the feed-gap case the comment above describes. The any_doc fallback
+        # below grabs whichever tick happens to be chronologically latest that day,
+        # which on a sparse day can be a random mid-morning/test tick nowhere near
+        # the real close — confirmed live: that produced a silently wrong
+        # previous_close every single morning, since _STABLE_PREV_CLOSE then locks
+        # that wrong value in for the rest of the day. Dhan's own historical-candle
+        # API is authoritative for a genuine daily close and doesn't depend on this
+        # process's own uptime, so it's tried first; any_doc stays as the last resort
+        # for when Dhan itself is unavailable (no enabled session / API error).
+        dhan_close = _dhan_daily_close(col, underlying, day_str)
+        if dhan_close > 0:
+            return dhan_close
         any_doc = col.find_one(
             {'underlying': underlying, 'timestamp': {'$gte': day_str, '$lt': f'{day_str}T23:59:59'}},
             sort=[('timestamp', -1)],
         )
         if any_doc:
             return _safe_float(any_doc.get('spot_price'))
+    return 0.0
+
+
+def _dhan_daily_close(col, underlying: str, day_str: str) -> float:
+    """
+    Authoritative previous-day close via Dhan's own historical-candle API
+    (fetch_dhan_daily_index_candles_cached — the same helper the TV chart page's
+    daily bars already go through), for `day_str`'s single session. Doesn't depend
+    on option_chain_index_spot having any tick recorded for that day at all, unlike
+    the any_doc fallback this backs up. Dhan specifically (not Kite): it's the
+    broker this app actually keeps an enabled, freshly-refreshed session for — same
+    kite_market_config lookup _fetch_dhan_index_quotes's own credential fetch above
+    already relies on; Kite's stored token here can sit stale for weeks since it's
+    normally used for market-data ticks, not this kind of on-demand REST call.
+    Returns 0.0 (never raises) on anything short of a clean result — no enabled
+    Dhan session, an unmapped underlying, or an API error — so callers fall through
+    to their own next-best fallback exactly as if this function didn't exist.
+    """
+    security_id = DHAN_INDEX_SECURITY_IDS.get(underlying.strip().upper())
+    if not security_id:
+        return 0.0
+    try:
+        cfg = col.database['kite_market_config'].find_one({'broker': 'dhan', 'enabled': True}) or {}
+        access_token = str(cfg.get('access_token') or '').strip()
+        if not access_token:
+            return 0.0
+        from features.candle_fetch import fetch_dhan_daily_index_candles_cached
+        day = datetime.strptime(day_str, '%Y-%m-%d')
+        candles = fetch_dhan_daily_index_candles_cached(security_id, access_token, underlying.strip().upper(), day, day)
+        if candles:
+            return _safe_float(candles[-1].get('close'))
+    except Exception as exc:
+        log.debug('dhan daily close fallback error underlying=%s day=%s: %s', underlying, day_str, exc)
     return 0.0
 
 
@@ -6744,20 +6879,7 @@ def _fetch_dhan_index_quotes(db: MongoData, underlyings: set[str]) -> dict[str, 
     session_day = _latest_trading_day(raw_db, today)
     quotes: dict[str, dict[str, float]] = {}
 
-    dhan_spot_ids = {
-        'NIFTY': '13',
-        'BANKNIFTY': '25',
-        'FINNIFTY': '27',
-        'SENSEX': '51',
-        'MIDCPNIFTY': '11915',
-        'BANKEX': '69',
-        # Same Dhan IDX_I security id kite_ticker.py/dhan_ticker.py/broker_gateway.py
-        # already use for VIX elsewhere (BROKER_VIX_TOKEN's dhan branch) — routed
-        # through this same batched quote + option_chain_index_spot prev-close
-        # lookup so the ticker bar's VIX tile gets change_pct/change_points too,
-        # not just a bare LTP (option_chain_index_spot rows tag VIX as 'INDIAVIX').
-        'INDIAVIX': '20225',
-    }
+    dhan_spot_ids = DHAN_INDEX_SECURITY_IDS
 
     def _quote_entry(spot_price: float, prev_close: float, ohlc_open: float, ohlc_high: float, ohlc_low: float) -> dict[str, float]:
         change_pct = round((spot_price - prev_close) / prev_close * 100, 2) if prev_close > 0 else 0.0
@@ -6990,6 +7112,10 @@ def _fetch_dhan_broker_option_positions(
         broker_refresh_user_tokens as _broker_refresh_user_tokens,
         get_broker_rest_quotes as _get_broker_rest_quotes,
     )
+    import time as _prof_time
+    _prof_t0 = _prof_time.perf_counter()
+    def _prof(label: str) -> None:
+        print(f"[POSITIONS_PROFILE] {label}: {_prof_time.perf_counter() - _prof_t0:.3f}s elapsed")
 
     raw_db = db._db if hasattr(db, '_db') else db
     broker_status: list[dict] = []
@@ -7035,6 +7161,7 @@ def _fetch_dhan_broker_option_positions(
     # _get_dhan_token_maps) since this metadata only changes when token-sync
     # runs, not on every poll.
     token_map, dhan_token_by_contract = _get_dhan_token_maps(raw_db)
+    _prof("after _get_dhan_token_maps")
 
     # ── FlatTrade / Kite: account docs only (mongo) ──
     # broker_configuration has no persisted "enabled"/"is_logged_in" flag for
@@ -7185,6 +7312,7 @@ def _fetch_dhan_broker_option_positions(
                 'message': account.get('message') or '',
             })
 
+    _prof(f"before dhan /v2/positions (target_kind={target_kind} dhan_logged_in={dhan_logged_in})")
     if target_kind == 'dhan' and dhan_logged_in:
         try:
             import requests as _req  # type: ignore
@@ -7199,10 +7327,12 @@ def _fetch_dhan_broker_option_positions(
                 },
                 timeout=8,
             )
+            _prof("after dhan /v2/positions HTTP call")
             payload = response.json() if response.ok else {}
             # Debug: raw Dhan /v2/positions response, untouched by our entry_price/exit_price
             # normalization below — compare this against Dhan's own UI numbers when they drift.
-            print(f"[DHAN RAW /v2/positions] broker_id={dhan_broker_id} status={response.status_code} payload={payload}")
+            print(f"[DHAN RAW /v2/positions] broker_id={dhan_broker_id} status={response.status_code} payload_len={len(str(payload))}")
+            _prof("after dhan /v2/positions payload parse+print")
             if isinstance(payload, list):
                 raw_positions = payload
             elif isinstance(payload, dict):
@@ -7374,12 +7504,14 @@ def _fetch_dhan_broker_option_positions(
         if token and ws_segment in {"NSE_FNO", "BSE_FNO"}:
             ws_segment_by_token[token] = ws_segment
 
+    _prof(f"before get_broker_rest_quotes (tokens={len(ws_segment_by_token)})")
     rest_quote_map: dict[str, dict] = {}
     if ws_segment_by_token:
         try:
             rest_quote_map = _get_broker_rest_quotes(list(ws_segment_by_token.keys()), raw_db, ws_segment_by_token)
         except Exception as exc:
             log.debug("dhan broker rest quote prefetch error: %s", exc)
+    _prof("after get_broker_rest_quotes")
 
     def _append_external_broker_leg(leg: dict, source: str, broker_label: str) -> None:
         """
@@ -7715,11 +7847,13 @@ def _fetch_dhan_broker_option_positions(
     # entry below instead of each leg holding its own (possibly stale or
     # inconsistent) copy.
     underlyings = {str(item.get('underlying') or '').strip() for item in open_positions if item.get('underlying')}
+    _prof(f"before _fetch_dhan_index_quotes (underlyings={underlyings})")
     try:
         underlying_quotes = _fetch_dhan_index_quotes(db, underlyings)
     except Exception as exc:
         log.warning('dhan index quote error: %s', exc)
         underlying_quotes = {}
+    _prof("after _fetch_dhan_index_quotes")
     for u in underlyings:
         if u in underlying_quotes:
             continue
@@ -7840,6 +7974,7 @@ def _fetch_dhan_broker_option_positions(
     elif target_kind == 'kite' and kite_detail:
         final_detail = kite_detail
 
+    _prof(f"TOTAL (open_positions={len(open_positions)})")
     return {
         'ok': not final_detail,
         'detail': final_detail,
