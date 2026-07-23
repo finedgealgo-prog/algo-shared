@@ -242,3 +242,27 @@ def require_current_user(authorization: Optional[str] = Header(None)) -> dict[st
     route depends on.
     """
     return _authenticate_request(authorization)
+
+
+def get_current_user_for_order_placement(authorization: Optional[str] = Header(None)) -> dict[str, Any]:
+    """Same as get_current_user, but gated by its OWN flag (LOCAL_TESTING) instead of the
+    shared AUTH_ENFORCEMENT_ENABLED kill switch — for the order-placement routes only
+    (algo.order's and algo.simulator's /trade/positions/place-order).
+
+    Local dev normally runs against its own local MongoDB (mongo_data.py's
+    MONGO_LIVE_DB_CONNECT = False) — a completely separate database from whatever Mongo
+    the real order-execution server (order.finedgealgo.com) connects to. That means a JWT
+    which is otherwise perfectly valid (right secret, not expired) still 401s with "User
+    not found" there: decode_access_token succeeds, but _authenticate_request's user
+    lookup runs against THAT process's own Mongo, and this session's user _id only ever
+    existed in the local one.
+
+    LOCAL_TESTING=true skips the real check for just this route (anonymous stub, same
+    shape AUTH_ENFORCEMENT_ENABLED=false already returns elsewhere) so order placement can
+    be exercised locally without needing both databases to agree on every user. Leave
+    false (default) anywhere real auth should actually apply — this must never be true on
+    a real production box, since it turns off auth for whoever can reach the route.
+    """
+    if _env_flag_enabled("LOCAL_TESTING", default=False):
+        return _ANONYMOUS_USER_STUB
+    return get_current_user(authorization)
