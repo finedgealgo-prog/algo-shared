@@ -104,7 +104,6 @@ from features.position_manager import (   # type: ignore
     # ── reentry ──────────────────────────────────────────────────────────────
     get_reentry_sl_config,   # reentry config after SL hit
     get_reentry_tp_config,   # reentry config after TP hit
-    build_reentry_action,    # constructs ReentryAction object
     # ── overall SL / target ──────────────────────────────────────────────────
     parse_overall_sl,        # extract overall SL (type + value) from strategy_cfg
     parse_overall_tgt,       # extract overall target from strategy_cfg
@@ -1293,10 +1292,10 @@ def check_leg_sl(
     The stored_sl (from DB) takes priority over a freshly computed one —
     this preserves manual SL updates and trail-SL moves.
     """
-    sl_price = stored_sl if stored_sl else calc_sl_price(leg_cfg, entry_price, is_sell_position)
+    sl_price = stored_sl if stored_sl else calc_sl_price(entry_price, is_sell_position, leg_cfg.get('LegStopLoss') or {})
     if not sl_price:
         return False, 0.0
-    hit = is_sl_hit(sl_price, current_price, is_sell_position)
+    hit = is_sl_hit(current_price, sl_price, is_sell_position)
     return hit, sl_price
 
 
@@ -1312,10 +1311,10 @@ def check_leg_target(
 
     Returns (tp_hit: bool, tp_price: float).
     """
-    tp_price = stored_tp if stored_tp else calc_tp_price(leg_cfg, entry_price, is_sell_position)
+    tp_price = stored_tp if stored_tp else calc_tp_price(entry_price, is_sell_position, leg_cfg.get('LegTarget') or {})
     if not tp_price:
         return False, 0.0
-    hit = is_tp_hit(tp_price, current_price, is_sell_position)
+    hit = is_tp_hit(current_price, tp_price, is_sell_position)
     return hit, tp_price
 
 
@@ -1337,7 +1336,7 @@ def compute_next_trail_sl(
     trail_cfg = get_trail_config(leg_cfg)
     if not trail_cfg:
         return stored_sl
-    return update_trail_sl(trail_cfg, entry_price, current_price, stored_sl, is_sell_position) or stored_sl
+    return update_trail_sl(entry_price, current_price, stored_sl, is_sell_position, trail_cfg) or stored_sl
 
 
 def update_leg_sl_in_db(
@@ -2190,17 +2189,31 @@ def handle_leg_reentry(
 
     trade_id = str(trade.get('_id') or '')
     leg_id   = str(leg.get('id') or '')
-    action   = build_reentry_action(reentry_cfg, leg, trade)
-    if not action:
-        return None
 
-    re_type  = str(action.reentry_type or '')
-    re_kind  = (
+    # Read the reentry kind straight off the raw config — NOT via
+    # build_reentry_action(), whose (leg_cfg, reentry_config, triggered_by,
+    # now_ts, existing_legs, idle_configs, parent_leg_type='') signature does
+    # not match a 3-positional-arg call and has no verified caller anywhere
+    # in the codebase (only this one, which would TypeError on first use).
+    re_type = str(reentry_cfg.get('Type') or '')
+    re_kind = (
         'lazy'         if 'NextLeg'   in re_type else
         'immediate'    if 'Immediate' in re_type else
         'at_cost'      if 'AtCost'    in re_type else
         'like_original'
     )
+
+    # Bounded reentry count: read THIS (closing) leg's own remaining budget,
+    # not the static config's ReentryCount — the static config is the same
+    # value on every generation (resolve_leg_cfg always walks back to it for
+    # SL/Target/Trail to keep applying), so gating on it directly would make
+    # reentries unbounded across generations. Mirrors
+    # execution_socket._reentry_budget_remaining (the live-path equivalent).
+    configured_count = safe_int((reentry_cfg.get('Value') or {}).get('ReentryCount'))
+    remaining = leg.get('reentry_count_remaining')
+    budget = safe_int(remaining) if remaining is not None else configured_count
+    if budget <= 0:
+        return None
 
     if re_kind == 'lazy':
         # Push the pre-configured "next leg" (NextLegRef) as a pending leg
@@ -2209,12 +2222,14 @@ def handle_leg_reentry(
         if next_leg_id and next_leg_cfg:
             new_leg = build_pending_leg(next_leg_id, next_leg_cfg, trade, now_ts,
                                         triggered_by=leg_id, leg_type=f'{leg_id}-lazyleg_1')
+            new_leg['reentry_count_remaining'] = budget - 1
             push_new_leg_in_db(db, trade_id, new_leg)
     elif re_kind in ('immediate', 'at_cost', 'like_original'):
         # Re-queue original leg config as a fresh pending leg
         new_leg_id = f'{leg_id}-reentry-{now_ts.replace(":", "").replace("-", "").replace("T", "")[:14]}'
         new_leg = build_pending_leg(new_leg_id, leg_cfg, trade, now_ts,
                                     triggered_by=leg_id, leg_type=f'{leg_id}-reentry')
+        new_leg['reentry_count_remaining'] = budget - 1
         push_new_leg_in_db(db, trade_id, new_leg)
 
     return f'reentry({re_kind}) queued after {exit_event} on leg={leg_id}'
@@ -3136,7 +3151,12 @@ def resolve_pending_leg_entry(
             f'entry_time={entry_time} '
             f'current_time={ctx.now_ts[11:16]}'
         )
-        return None  # too early
+        return {
+            '__skip__': True,
+            'reason': 'too_early',
+            'message': f'Waiting for entry time {entry_time} (current {ctx.now_ts[11:16]})',
+            'is_blocking': False,
+        }
 
     # 2. Resolve expiry
     expiry = resolve_leg_expiry(ctx.db, leg_cfg, underlying, ctx.now_ts, ctx.market_cache)
@@ -3148,7 +3168,12 @@ def resolve_pending_leg_entry(
             f'underlying={underlying or "-"} '
             f'now_ts={ctx.now_ts}'
         )
-        return None
+        return {
+            '__skip__': True,
+            'reason': 'expiry_missing',
+            'message': f'Could not resolve option expiry for {underlying or "underlying"}',
+            'is_blocking': True,
+        }
 
     # 3. Resolve spot & strike
     spot = get_spot_at_time(ctx.db, underlying, ctx.now_ts, ctx.market_cache)
@@ -3160,7 +3185,12 @@ def resolve_pending_leg_entry(
             f'underlying={underlying or "-"} '
             f'expiry={expiry}'
         )
-        return None
+        return {
+            '__skip__': True,
+            'reason': 'spot_missing',
+            'message': f'Spot price for {underlying or "underlying"} not available yet',
+            'is_blocking': True,
+        }
 
     strike = resolve_leg_strike(ctx.db, leg_cfg, underlying, expiry, option_type, spot, ctx.now_ts, ctx.market_cache)
     if not strike:
@@ -3173,7 +3203,12 @@ def resolve_pending_leg_entry(
             f'spot={spot} '
             f'option_type={option_type or "-"}'
         )
-        return None
+        return {
+            '__skip__': True,
+            'reason': 'strike_missing',
+            'message': f'Could not resolve strike for {underlying or "underlying"} {option_type} (spot {spot})',
+            'is_blocking': True,
+        }
 
     # 4. Fetch chain doc → entry price
     chain_doc = normalize_chain_fields(
@@ -3191,7 +3226,12 @@ def resolve_pending_leg_entry(
             f'option_type={option_type or "-"} '
             f'chain_keys={list((chain_doc or {}).keys())}'
         )
-        return None  # contract not listed / no data
+        return {
+            '__skip__': True,
+            'reason': 'chain_price_missing',
+            'message': f'Option price not available for {underlying or "underlying"} {strike} {option_type} (expiry {expiry})',
+            'is_blocking': True,
+        }  # contract not listed / no data
 
     # 5. Momentum gate (if configured)
     if has_momentum_config(leg_cfg):
@@ -3225,7 +3265,12 @@ def resolve_pending_leg_entry(
                 f'target_price={target_price} '
                 f'current_price={entry_price}'
             )
-            return None  # waiting for momentum trigger
+            return {
+                '__skip__': True,
+                'reason': 'momentum_not_triggered',
+                'message': f'Waiting for momentum trigger ({momentum_type} {momentum_value}, current {entry_price} vs target {target_price})',
+                'is_blocking': False,
+            }  # waiting for momentum trigger
 
     # ── Entry approved — build entry_trade ───────────────────────────────
     lot_size  = safe_int(leg_cfg.get('LotSize') or leg.get('lot_size') or 1)
@@ -3365,6 +3410,41 @@ def _store_position_history_for_entry(
     return True, inserted_id
 
 
+def _record_entry_skip_reason(
+    ctx: TickContext,
+    trade_id: str,
+    leg_id: str,
+    reason: str,
+    message: str,
+) -> None:
+    """
+    Persist why a pending leg's entry couldn't be taken this tick, so the
+    strategy row in the UI can surface it. Only called for blocking reasons
+    (missing expiry/spot/strike/chain price) — waiting states are not stored.
+    """
+    try:
+        ctx.db._db[COL_ALGO_TRADES].update_one(
+            {'_id': trade_id},
+            {'$set': {
+                'entry_error': {
+                    'leg_id':  leg_id,
+                    'reason':  reason,
+                    'message': message,
+                    'at':      ctx.now_ts,
+                },
+            }},
+        )
+    except Exception as exc:
+        log.warning('entry skip reason write error trade=%s leg=%s: %s', trade_id, leg_id, exc)
+        return
+
+    try:
+        from features.execution_socket import mark_execute_order_dirty_from_trade_id  # type: ignore
+        mark_execute_order_dirty_from_trade_id(ctx.db, trade_id)
+    except Exception:
+        pass
+
+
 def process_pending_entries(
     ctx: TickContext,
     running_trades: list[dict],
@@ -3427,6 +3507,18 @@ def process_pending_entries(
             if result is None:
                 continue
 
+            # Skip with a reason — persist reasons that represent a real
+            # blocker (missing expiry/spot/strike/chain price) so the UI can
+            # show why entry hasn't been taken. Waiting states (too_early,
+            # momentum not yet triggered) are expected and not persisted.
+            if result.get('__skip__'):
+                if result.get('is_blocking'):
+                    _record_entry_skip_reason(
+                        ctx, trade_id, str(leg.get('id') or ''),
+                        str(result.get('reason') or ''), str(result.get('message') or ''),
+                    )
+                continue
+
             # Handle momentum arming (set base_price, defer actual entry)
             if result.get('__arm_momentum__'):
                 try:
@@ -3447,11 +3539,13 @@ def process_pending_entries(
             entry_trade = result
             leg_id      = str(leg.get('id') or '')
 
-            # Write entry_trade to algo_trades
+            # Write entry_trade to algo_trades. Only clear entry_error if it was
+            # reported against THIS leg — a sibling leg that's still blocked must
+            # keep its error visible, not have it wiped by an unrelated leg's
+            # successful entry.
             try:
-                ctx.db._db[COL_ALGO_TRADES].update_one(
-                    {'_id': trade_id},
-                    {'$set': {
+                update_ops: dict = {
+                    '$set': {
                         f'legs.{leg_index}.entry_trade':    entry_trade,
                         f'legs.{leg_index}.expiry_date':    entry_trade.get('expiry'),
                         f'legs.{leg_index}.strike':         entry_trade.get('strike'),
@@ -3459,8 +3553,14 @@ def process_pending_entries(
                         f'legs.{leg_index}.token':          entry_trade.get('token') or entry_trade.get('instrument_token'),
                         f'legs.{leg_index}.symbol':         entry_trade.get('symbol'),
                         f'legs.{leg_index}.exchange':       entry_trade.get('exchange'),
-                    }},
-                )
+                    },
+                }
+                _current_trade_doc = ctx.db._db[COL_ALGO_TRADES].find_one(
+                    {'_id': trade_id}, {'entry_error': 1},
+                ) or {}
+                if str((_current_trade_doc.get('entry_error') or {}).get('leg_id') or '') == leg_id:
+                    update_ops['$unset'] = {'entry_error': ''}
+                ctx.db._db[COL_ALGO_TRADES].update_one({'_id': trade_id}, update_ops)
             except Exception as exc:
                 log.error('write entry_trade error trade=%s leg=%s: %s', trade_id, leg_id, exc)
                 continue

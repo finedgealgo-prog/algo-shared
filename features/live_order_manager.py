@@ -427,6 +427,56 @@ def _get_bid_ask(kite, symbol: str, ltp: float, exchange: str = _NFO) -> tuple[f
         return 0.0, 0.0
 
 
+def _get_market_depth(kite, symbol: str, exchange: str = _NFO) -> tuple[list[dict], list[dict]]:
+    """
+    Full multi-level market depth (best→worst, price+quantity per level) via kite.quote() —
+    same call _get_bid_ask makes, just keeping every level instead of collapsing to level 0.
+    Returns ([], []) — never a fabricated level — when depth is unavailable for any reason.
+    """
+    try:
+        exch = str(exchange or _NFO).upper()
+        sym_key = f'{exch}:{symbol}'
+        q = kite.quote([sym_key])
+        depth = (q.get(sym_key) or {}).get('depth') or {}
+
+        def _levels(raw: list) -> list[dict]:
+            out = []
+            for lvl in raw or []:
+                price = _safe_float(lvl.get('price'), 0.0)
+                if price > 0:
+                    out.append({'price': price, 'quantity': int(lvl.get('quantity') or 0)})
+            return out
+
+        return _levels(depth.get('buy')), _levels(depth.get('sell'))
+    except Exception as exc:
+        log.debug('_get_market_depth error exchange=%s symbol=%s: %s', exchange, symbol, exc)
+        return [], []
+
+
+def _walk_depth_for_qty(levels: list[dict], qty: int) -> tuple[float, bool]:
+    """
+    Walk order-book levels best→worst, accumulating quantity, until >= qty is covered.
+    Returns (price of the worst level needed, fully_covered). A price based on only the
+    top level (the old behavior) silently assumes the whole order fills at that one price —
+    fine for a 1-lot order, but for a bigger qty than the top level actually holds, the rest
+    would either rest unfilled or walk into worse prices anyway; better to price for the
+    depth the order actually needs up front. fully_covered=False means even the deepest
+    visible level isn't enough — that's a real liquidity limit, not something more book data
+    would fix, so the caller still uses that deepest level's price (the most protection the
+    visible book can offer) and surfaces a warning instead of blocking the order.
+    """
+    if not levels or qty <= 0:
+        return 0.0, False
+    covered = 0
+    price = levels[0]['price']
+    for lvl in levels:
+        price = lvl['price']
+        covered += lvl['quantity']
+        if covered >= qty:
+            return price, True
+    return price, False
+
+
 # ── Kite instance ─────────────────────────────────────────────────────────────
 
 def _get_leg_modification_config(trade: dict, leg_id: str) -> tuple[bool, int]:
@@ -1878,33 +1928,48 @@ def place_live_entry_order(
     if force_order_type:
         pass
     elif order_type == _ORDER_TYPE_MPP:
-        # Algotest MPP formula:
-        #   BUY  → BID + pct%  (crosses ask → guaranteed fill, less overpay)
-        #   SELL → ASK - pct%  (crosses bid → guaranteed fill, less slippage)
+        # MPP formula: price off the side this order actually has to sweep to fill qty —
+        # a BUY matches against resting ASK orders, a SELL matches against resting BID
+        # orders — not the order's own resting side. Walking that side's depth (instead of
+        # just its top price) means a qty bigger than the top level's own quantity still
+        # prices to reach however many levels are needed to cover it, so the order isn't
+        # silently priced as if only the top-of-book quantity existed.
+        #   BUY  → walked ASK price + pct%  (crosses ask deep enough for qty, guaranteed fill)
+        #   SELL → walked BID price - pct%  (crosses bid deep enough for qty, guaranteed fill)
         # Then: tick align to 0.05, min sell price ₹0.05
-        bid, ask = _get_bid_ask(kite, symbol, ltp, exchange)
-        # Never substitute ltp for a missing bid/ask — that isn't a live book price and
-        # would place a real order at a fabricated "protected" price with no depth behind
-        # it. Abort instead of guessing; the caller must not proceed to place this order.
-        if (is_buy_order and bid <= 0) or (not is_buy_order and ask <= 0):
-            log.error('[MPP ENTRY BLOCKED] symbol=%s bid=%s ask=%s — no live depth, order NOT placed', symbol, bid, ask)
+        buy_depth, sell_depth = _get_market_depth(kite, symbol, exchange)
+        consume_side = sell_depth if is_buy_order else buy_depth
+        walked_price, fully_covered = _walk_depth_for_qty(consume_side, qty)
+        # Never substitute ltp for missing depth — that isn't a live book price and would
+        # place a real order at a fabricated "protected" price with no depth behind it.
+        # Abort instead of guessing; the caller must not proceed to place this order.
+        if walked_price <= 0:
+            log.error('[MPP ENTRY BLOCKED] symbol=%s qty=%d side=%s — no live depth, order NOT placed', symbol, qty, 'ask' if is_buy_order else 'bid')
             notify_admin(
                 'mpp_price_unresolved',
-                f'MPP entry price unavailable for {symbol} (bid={bid}, ask={ask}) — order NOT placed. '
+                f'MPP entry price unavailable for {symbol} (qty={qty}) — order NOT placed. '
                 f'trade={trade_id} leg={leg_id}',
             )
             return {'order_id': '', 'order_type': _ORDER_TYPE_MPP, 'limit_price': 0.0,
                     'trigger_price': 0.0, 'order_status': 'FAILED', 'error': 'mpp_price_unavailable'}
+        if not fully_covered:
+            log.warning(
+                '[MPP ENTRY] symbol=%s qty=%d not fully covered by visible %s-side depth — '
+                'pricing off deepest visible level %.2f; remainder may rest unfilled until the book replenishes',
+                symbol, qty, 'ask' if is_buy_order else 'bid', walked_price,
+            )
+            notify_admin(
+                'mpp_depth_insufficient',
+                f'MPP entry for {symbol} qty={qty} exceeds visible {"ask" if is_buy_order else "bid"}-side depth — '
+                f'priced off deepest level {walked_price}, remainder may not fill immediately. trade={trade_id} leg={leg_id}',
+            )
         pct = _mpp_protection_pct(ltp, is_option=True)
-        if is_buy_order:
-            raw_price = bid * (1 + pct / 100)
-        else:
-            raw_price = ask * (1 - pct / 100)
+        raw_price = walked_price * (1 + pct / 100) if is_buy_order else walked_price * (1 - pct / 100)
         limit_price = _clamp_limit_price(raw_price, is_buy_order)
         kite_order_type = _ORDER_TYPE_LIMIT
         print(
-            f'[MPP ENTRY] symbol={symbol} ltp={ltp} bid={bid} ask={ask} '
-            f'pct={pct}% limit_price={limit_price} is_buy={is_buy_order}'
+            f'[MPP ENTRY] symbol={symbol} ltp={ltp} qty={qty} walked_price={walked_price} '
+            f'fully_covered={fully_covered} pct={pct}% limit_price={limit_price} is_buy={is_buy_order}'
         )
     elif order_type == _ORDER_TYPE_LIMIT:
         if trigger_buffer > 0:
@@ -2113,34 +2178,44 @@ def place_live_exit_order(
     if force_order_type:
         pass
     elif order_type == _ORDER_TYPE_MPP:
-        # Algotest MPP formula:
-        #   BUY to close  → BID + pct%
-        #   SELL to close → ASK - pct%
-        bid, ask = _get_bid_ask(kite, symbol, exit_price, exchange)
+        # Same consume-the-opposite-side depth walk as place_live_entry_order — see that
+        # function's MPP branch for why. Exit direction: closing a SELL position means
+        # BUYing (sweeps ASK), closing a BUY position means SELLing (sweeps BID).
         is_exit_buy = is_sell   # sell position → BUY to close; buy position → SELL to close
-        # Never substitute exit_price for a missing bid/ask — same reasoning as the entry
-        # path (see place_live_entry_order). Note: this blocks the exit order itself, so a
+        buy_depth, sell_depth = _get_market_depth(kite, symbol, exchange)
+        consume_side = sell_depth if is_exit_buy else buy_depth
+        walked_price, fully_covered = _walk_depth_for_qty(consume_side, qty)
+        # Never substitute exit_price for missing depth — same reasoning as the entry path
+        # (see place_live_entry_order). Note: this blocks the exit order itself, so a
         # pending SL/target on this leg stays unprotected until the next monitor cycle
         # retries — surfaced loudly via Telegram specifically because of that.
-        if (is_exit_buy and bid <= 0) or (not is_exit_buy and ask <= 0):
-            log.error('[MPP EXIT BLOCKED] symbol=%s bid=%s ask=%s reason=%s — no live depth, order NOT placed', symbol, bid, ask, exit_reason)
+        if walked_price <= 0:
+            log.error('[MPP EXIT BLOCKED] symbol=%s qty=%d side=%s reason=%s — no live depth, order NOT placed', symbol, qty, 'ask' if is_exit_buy else 'bid', exit_reason)
             notify_admin(
                 'mpp_price_unresolved',
-                f'MPP exit price unavailable for {symbol} (bid={bid}, ask={ask}, reason={exit_reason}) — '
+                f'MPP exit price unavailable for {symbol} (qty={qty}, reason={exit_reason}) — '
                 f'order NOT placed, leg remains open. trade={trade_id} leg={leg_id}',
             )
             return {'order_id': '', 'order_type': _ORDER_TYPE_MPP, 'limit_price': 0.0,
                     'trigger_price': 0.0, 'order_status': 'FAILED', 'error': 'mpp_price_unavailable'}
+        if not fully_covered:
+            log.warning(
+                '[MPP EXIT] symbol=%s qty=%d not fully covered by visible %s-side depth — '
+                'pricing off deepest visible level %.2f; remainder may rest unfilled until the book replenishes',
+                symbol, qty, 'ask' if is_exit_buy else 'bid', walked_price,
+            )
+            notify_admin(
+                'mpp_depth_insufficient',
+                f'MPP exit for {symbol} qty={qty} exceeds visible {"ask" if is_exit_buy else "bid"}-side depth — '
+                f'priced off deepest level {walked_price}, remainder may not fill immediately. reason={exit_reason} trade={trade_id} leg={leg_id}',
+            )
         pct = _mpp_protection_pct(exit_price, is_option=True)
-        if is_exit_buy:
-            raw_price = bid * (1 + pct / 100)
-        else:
-            raw_price = ask * (1 - pct / 100)
+        raw_price = walked_price * (1 + pct / 100) if is_exit_buy else walked_price * (1 - pct / 100)
         limit_price = _clamp_limit_price(raw_price, is_exit_buy)
         kite_order_type = _ORDER_TYPE_LIMIT
         print(
-            f'[MPP EXIT] symbol={symbol} exit_price={exit_price} bid={bid} ask={ask} '
-            f'pct={pct}% limit_price={limit_price} reason={exit_reason}'
+            f'[MPP EXIT] symbol={symbol} exit_price={exit_price} qty={qty} walked_price={walked_price} '
+            f'fully_covered={fully_covered} pct={pct}% limit_price={limit_price} reason={exit_reason}'
         )
     elif exit_reason == 'stoploss':
         # SL-L: already at SL price; trigger = exit_price, limit = exit_price - buffer

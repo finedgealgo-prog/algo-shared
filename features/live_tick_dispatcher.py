@@ -141,43 +141,44 @@ def _persist_spot_ticks(db: MongoData, spot_ticks_received: list[tuple[str, floa
         logger.error("spot write error source=%s: %s", source, exc)
 
 
-def _run_momentum_for_live_ff(
+
+# Bounded worker count for parallel per-trade entry processing. Deliberately
+# NOT "one thread per trade" (10,000 users due at the same entry_time would
+# mean 10,000 raw threads — ~8MB stack each, GIL contention, way past what
+# any connection pool can serve) — this caps concurrent Mongo connections /
+# broker order calls to something the pool and downstream systems can absorb,
+# while still processing the whole batch in parallel instead of strictly one
+# trade after another. Each user's own broker credentials are resolved
+# per-trade (get_broker_for_trade), so this doesn't serialize on a single
+# shared broker session. Sized against MongoData's maxPoolSize (see
+# mongo_data.py) — keep comfortably under it since other request paths in
+# the same process share that same pool.
+_MOMENTUM_BATCH_MAX_WORKERS = 90
+
+
+def _process_one_trade_momentum(
     db: MongoData,
+    trade_id: str,
     trade_date: str,
     activation_mode: str,
     now_ts: str,
-    records: list,
+    chain_col,
+    ltp_map: dict,
+    spot_map: dict,
 ) -> None:
     """
-    Process momentum-pending legs for ALL running live/fast-forward trades on every tick.
-    This runs independently of entry_time so already-running strategies with queued
-    momentum legs are also checked.
+    One trade's worth of the momentum-pending check — isolated so a single
+    trade's exception (bad config, transient DB hiccup, etc.) can't abort
+    entry-checking for every other trade in the same batch.
     """
     from features.execution_socket import (
-        OPTION_CHAIN_COLLECTION,
         _process_momentum_pending_feature_legs,
         mark_execute_order_dirty_from_trade,
     )
-
-    chain_col = db._db[OPTION_CHAIN_COLLECTION]
-
-    # Build ltp_map and spot_map from Kite ticker once for all trades
-    ltp_map: dict = {}
-    spot_map: dict = {}
     try:
-        from features.broker_gateway import broker_ticker_manager as _tm_run  # type: ignore
-        ltp_map = dict(_tm_run.ltp_map or {})
-        spot_map = dict(_tm_run.spot_map or {})
-    except Exception:
-        pass
-
-    for record in (records or []):
-        trade_id = str(record.get('_id') or '').strip()
-        if not trade_id:
-            continue
         trade = db._db['algo_trades'].find_one({'_id': trade_id})
         if not trade:
-            continue
+            return
         underlying = str(
             (trade.get('config') or {}).get('Ticker')
             or trade.get('ticker') or ''
@@ -211,6 +212,81 @@ def _run_momentum_for_live_ff(
                 f'[MOMENTUM ENTERED] trade_id={trade_id} '
                 f'mode={activation_mode} legs={entered_ids}'
             )
+    except Exception as exc:
+        logger.error('momentum batch error trade=%s mode=%s: %s', trade_id, activation_mode, exc)
+
+
+def _run_momentum_for_live_ff(
+    db: MongoData,
+    trade_date: str,
+    activation_mode: str,
+    now_ts: str,
+    records: list,
+) -> None:
+    """
+    Process momentum-pending legs for ALL running live/fast-forward trades on every tick.
+    This runs independently of entry_time so already-running strategies with queued
+    momentum legs are also checked.
+
+    Runs the batch across a small worker pool (not strictly one trade after
+    another) so that when many users share the same entry_time, they aren't
+    queued behind each other's Mongo writes / broker order calls.
+    """
+    from features.execution_socket import OPTION_CHAIN_COLLECTION
+
+    chain_col = db._db[OPTION_CHAIN_COLLECTION]
+
+    # Build ltp_map and spot_map from Kite ticker once for all trades
+    ltp_map: dict = {}
+    spot_map: dict = {}
+    try:
+        from features.broker_gateway import broker_ticker_manager as _tm_run  # type: ignore
+        ltp_map = dict(_tm_run.ltp_map or {})
+        spot_map = dict(_tm_run.spot_map or {})
+    except Exception:
+        pass
+
+    trade_ids = [
+        str(record.get('_id') or '').strip()
+        for record in (records or [])
+        if str(record.get('_id') or '').strip()
+    ]
+    if not trade_ids:
+        return
+
+    # Phase 1 of the async migration (see
+    # /home/ashok-innoppl/.claude/plans/golden-dazzling-garden.md) — routes
+    # fast-forward only through a dedicated async event loop (motor for DB,
+    # asyncio.to_thread for broker/chain I/O) instead of the ThreadPoolExecutor
+    # below. live/forward-test are untouched. Default off — flip
+    # ASYNC_FAST_FORWARD_ENTRY_ENABLED=true to test.
+    if activation_mode == 'fast-forward':
+        try:
+            from features.async_entry_engine import async_fast_forward_enabled, run_fast_forward_batch
+            if async_fast_forward_enabled():
+                run_fast_forward_batch(trade_ids, trade_date, now_ts, ltp_map, spot_map)
+                return
+        except Exception as exc:
+            logger.error('async fast-forward path errored, falling back to sync path: %s', exc)
+
+    if len(trade_ids) == 1:
+        # Skip the thread-pool overhead for the common single-trade case.
+        _process_one_trade_momentum(
+            db, trade_ids[0], trade_date, activation_mode, now_ts, chain_col, ltp_map, spot_map,
+        )
+        return
+
+    from concurrent.futures import ThreadPoolExecutor
+    with ThreadPoolExecutor(max_workers=_MOMENTUM_BATCH_MAX_WORKERS) as pool:
+        futures = [
+            pool.submit(
+                _process_one_trade_momentum,
+                db, trade_id, trade_date, activation_mode, now_ts, chain_col, ltp_map, spot_map,
+            )
+            for trade_id in trade_ids
+        ]
+        for future in futures:
+            future.result()  # re-raise is impossible here — errors are caught inside the helper
 
 
 def _run_entries_for_mode(

@@ -205,6 +205,11 @@ class _DhanTickerManager:
         # option chains — also REQ_FULL_SUB as of the option-chain latency fix).
         self.bid_map:         dict[str, float] = {}
         self.ask_map:         dict[str, float] = {}
+        # Quantity at that same level-0 bid/ask — unpacked alongside bid_map/ask_map from
+        # the same Full-packet depth block, previously discarded. Lets MPP pricing know how
+        # much qty is actually available at the top price instead of assuming it's enough.
+        self.bid_qty_map:     dict[str, int]   = {}
+        self.ask_qty_map:     dict[str, int]   = {}
         self.spot_map:        dict[str, float] = {}
         self.status:          str  = "stopped"
         self.error_msg:       str  = ""
@@ -318,6 +323,8 @@ class _DhanTickerManager:
             self.prev_close_map     = {}
             self.bid_map            = {}
             self.ask_map            = {}
+            self.bid_qty_map        = {}
+            self.ask_qty_map        = {}
             self.spot_map           = {}
             self.tick_count    = 0
             self._active_spot_tokens = dict(active_spot_tokens)
@@ -798,8 +805,10 @@ class _DhanTickerManager:
                         _FULL_DEPTH_L0.unpack_from(data, depth_offset)
                     if bid_val > 0:
                         self.bid_map[sid_str] = bid_val
+                        self.bid_qty_map[sid_str] = _bid_qty
                     if ask_val > 0:
                         self.ask_map[sid_str] = ask_val
+                        self.ask_qty_map[sid_str] = _ask_qty
                 except Exception:
                     pass
 
@@ -1099,9 +1108,11 @@ class _DhanTickerManager:
                             _FULL_DEPTH_L0.unpack_from(data, depth_offset)
                         if bid_val > 0:
                             self.bid_map[sid_str] = bid_val
+                            self.bid_qty_map[sid_str] = _bid_qty
                             changed_bid[sid_str] = bid_val
                         if ask_val > 0:
                             self.ask_map[sid_str] = ask_val
+                            self.ask_qty_map[sid_str] = _ask_qty
                             changed_ask[sid_str] = ask_val
                     except Exception:
                         pass

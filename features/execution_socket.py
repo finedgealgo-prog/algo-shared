@@ -486,6 +486,7 @@ def _record_signature(records: list[dict]) -> str:
                 key=lambda x: x['id'],
             ),
             'strategy_feature_rows': _normalize_feature_rows(r.get('strategy_feature_status_rows')),
+            'entry_error': r.get('entry_error'),
         })
     return hashlib.md5(_json.dumps(sig, sort_keys=True, default=str).encode()).hexdigest()
 
@@ -3496,6 +3497,74 @@ def _queue_live_broker_pending_momentum_entry(
     return True
 
 
+def _record_live_entry_blocked(
+    db: MongoData,
+    trade: dict,
+    leg_id: str,
+    reason: str,
+    message: str,
+    now_ts: str,
+    option_type: str = '',
+    expiry_kind: str = '',
+    strike_parameter: Any = None,
+) -> None:
+    """
+    Persist + surface a live/fast-forward/forward-test entry-resolution failure
+    (missing expiry/chain/strike, or an unexpected exception) that would
+    otherwise just be a print()/log line and retried silently forever.
+
+    Writes the same `entry_error` shape trading_core._record_entry_skip_reason
+    uses (so the existing FastForward/ForwardTest UI banner picks it up),
+    appends a queryable `entry_blocked` row via notification_manager, and
+    notifies the strategy owner + admin over Telegram (deduped 45s by
+    telegram_notifier itself, so a persistent failure re-alerts periodically
+    rather than spamming every tick).
+    """
+    trade_id = str(trade.get('_id') or '')
+    try:
+        db._db['algo_trades'].update_one(
+            {'_id': trade_id},
+            {'$set': {
+                'entry_error': {
+                    'leg_id':  leg_id,
+                    'reason':  reason,
+                    'message': message,
+                    'at':      now_ts,
+                },
+            }},
+        )
+    except Exception as exc:
+        log.warning('live entry-blocked write error trade=%s leg=%s: %s', trade_id, leg_id, exc)
+
+    try:
+        mark_execute_order_dirty_from_trade(trade)
+    except Exception:
+        pass
+
+    try:
+        from features.notification_manager import record_entry_blocked
+        record_entry_blocked(
+            db._db, trade, leg_id, reason, message, now_ts,
+            option_type=option_type, expiry_kind=expiry_kind, strike_parameter=strike_parameter,
+        )
+    except Exception as exc:
+        log.warning('record_entry_blocked error trade=%s leg=%s: %s', trade_id, leg_id, exc)
+
+    try:
+        from features.telegram_notifier import notify_admin, notify_user_for
+        _ctx = {'trade_id': trade_id, 'leg_id': leg_id, 'reason': reason}
+        notify_admin('entry_blocked', f'Entry blocked for leg {leg_id}: {message or reason}', _ctx)
+        _uid = str(trade.get('user_id') or '').strip()
+        if _uid:
+            notify_user_for(
+                _uid, 'entry_blocked',
+                f'Your strategy could not take entry for leg {leg_id}: {message or reason}',
+                _ctx,
+            )
+    except Exception as exc:
+        log.warning('entry-blocked telegram notify error trade=%s leg=%s: %s', trade_id, leg_id, exc)
+
+
 def _process_momentum_pending_feature_legs(
     db: MongoData, trade: dict, chain_col, trade_date: str, now_ts: str,
     lot_size: int, index_spot_doc: dict | None = None, market_cache: dict | None = None,
@@ -3754,6 +3823,11 @@ def _process_momentum_pending_feature_legs(
                     if not live_expiry:
                         # print(f'[PENDING FEATURE FLOW] trade_id={trade_id} leg_id={leg_id or "-"} mode={activation_mode or "-"} state=live_expiry_missing underlying={underlying} option_type={opt_norm}')
                         entry_print(f'[MOMENTUM PENDING] leg={leg_id} no expiry in active_option_tokens — skipping')
+                        _record_live_entry_blocked(
+                            db, trade, leg_id, 'expiry_missing',
+                            f'No {expiry_kind} expiry found in active_option_tokens for {underlying} {opt_norm}.',
+                            now_ts, option_type=opt_norm, expiry_kind=expiry_kind, strike_parameter=strike_param_raw,
+                        )
                         continue
 
                     _cache_key = (underlying, live_expiry)
@@ -3769,6 +3843,11 @@ def _process_momentum_pending_feature_legs(
                     if not chain.get('CE') and not chain.get('PE'):
                         # print(f'[PENDING FEATURE FLOW] trade_id={trade_id} leg_id={leg_id or "-"} mode={activation_mode or "-"} state=live_chain_empty underlying={underlying} expiry={live_expiry}')
                         entry_print(f'[MOMENTUM PENDING] leg={leg_id} empty chain {underlying} {live_expiry} — skipping')
+                        _record_live_entry_blocked(
+                            db, trade, leg_id, 'chain_empty',
+                            f'Option chain for {underlying} {live_expiry} came back empty (no CE/PE rows).',
+                            now_ts, option_type=opt_norm, expiry_kind=expiry_kind, strike_parameter=strike_param_raw,
+                        )
                         continue
 
                     if _strike_locked:
@@ -3795,6 +3874,12 @@ def _process_momentum_pending_feature_legs(
                         if not sel:
                             # print(f'[PENDING FEATURE FLOW] trade_id={trade_id} leg_id={leg_id or "-"} mode={activation_mode or "-"} state=strike_selection_failed underlying={underlying} expiry={live_expiry} entry_kind={entry_kind or "-"}')
                             entry_print(f'[MOMENTUM PENDING] leg={leg_id} no strike found — skipping')
+                            _record_live_entry_blocked(
+                                db, trade, leg_id, 'strike_missing',
+                                f'Could not select a strike for {underlying} {live_expiry} {opt_norm} '
+                                f'(entry_kind={entry_kind or "-"}, strike_parameter={strike_param_raw!r}).',
+                                now_ts, option_type=opt_norm, expiry_kind=expiry_kind, strike_parameter=strike_param_raw,
+                            )
                             continue
 
                         expiry         = live_expiry
@@ -3811,12 +3896,17 @@ def _process_momentum_pending_feature_legs(
                 except Exception as exc:
                     log.warning('live chain resolve error leg=%s: %s', leg_id, exc)
                     # print(f'[PENDING FEATURE FLOW] trade_id={trade_id} leg_id={leg_id or "-"} mode={activation_mode or "-"} state=live_chain_exception error={exc}')
+                    _record_live_entry_blocked(
+                        db, trade, leg_id, 'resolve_exception',
+                        f'Unexpected error resolving live chain/strike for {underlying} {opt_norm}: {exc}',
+                        now_ts, option_type=opt_norm, expiry_kind=expiry_kind, strike_parameter=strike_param_raw,
+                    )
                     continue
 
         elif not expiry or strike in (None, ''):
             # Backtest: resolve from historical chain_col
             try:
-                expiry, expiry_err = resolve_expiry(chain_col, underlying, option_type, trade_date, now_ts)
+                expiry, expiry_err = resolve_expiry(chain_col, underlying, option_type, trade_date, now_ts, expiry_kind=expiry_kind)
                 if expiry_err:
                     entry_print(f'[MOMENTUM PENDING] leg={leg_id} expiry resolve error: {expiry_err}')
                     continue
@@ -4294,6 +4384,15 @@ def _process_momentum_pending_feature_legs(
             # Result: legs[] has only string IDs, no full dicts
             _store_position_history(db, trade, new_leg, override_leg_cfg=leg_cfg)
             entered_ids.append(leg_id)
+            # Clear entry_error only if it was reported against THIS leg — a
+            # sibling leg still blocked on its own resolution failure must
+            # keep its error visible in the UI.
+            try:
+                _cur_err_doc = db._db['algo_trades'].find_one({'_id': trade_id}, {'entry_error': 1}) or {}
+                if str((_cur_err_doc.get('entry_error') or {}).get('leg_id') or '') == leg_id:
+                    db._db['algo_trades'].update_one({'_id': trade_id}, {'$unset': {'entry_error': ''}})
+            except Exception:
+                pass
         except Exception as exc:
             log.error('momentum_pending entry error leg=%s: %s', leg_id, exc)
             try:
@@ -4874,7 +4973,10 @@ def _try_enter_pending_leg(db: MongoData, trade: dict, leg: dict,
             'chain_delta': _safe_float(_sel.get('delta')),
         }
     elif not expiry or strike in (None, ''):
-        expiry, expiry_err = resolve_expiry(chain_col, underlying, option_type, trade_date, snapshot_timestamp)
+        expiry, expiry_err = resolve_expiry(
+            chain_col, underlying, option_type, trade_date, snapshot_timestamp,
+            expiry_kind=str(leg.get('expiry_kind') or 'ExpiryType.Weekly'),
+        )
         if expiry_err:
             entry_print(f'[ENTRY MISS] leg={leg_id_log} underlying={underlying} option={option_type} trade_date={trade_date} reason={expiry_err}')
             return False, expiry_err
@@ -5151,7 +5253,10 @@ def _try_enter_pending_leg(db: MongoData, trade: dict, leg: dict,
                         entry_print(f'[ENTRY MISS] leg={leg_id_log} underlying={underlying} option={option_type} reason={miss_reason}')
                         return False, miss_reason
                 else:
-                    expiry, expiry_err = resolve_expiry(chain_col, underlying, option_type, trade_date, snapshot_timestamp)
+                    expiry, expiry_err = resolve_expiry(
+                        chain_col, underlying, option_type, trade_date, snapshot_timestamp,
+                        expiry_kind=str(leg.get('expiry_kind') or 'ExpiryType.Weekly'),
+                    )
                     if expiry_err:
                         entry_print(f'[ENTRY MISS] leg={leg_id_log} underlying={underlying} option={option_type} trade_date={trade_date} reason={expiry_err}')
                         return False, expiry_err
@@ -5735,6 +5840,7 @@ def _serialize_trade_record(item: dict) -> dict:
         'portfolio': item.get('portfolio') if isinstance(item.get('portfolio'), dict) else {},
         'live_sim_order': item.get('live_sim_order'),
         'strategy': item.get('strategy') if isinstance(item.get('strategy'), dict) else {},
+        'entry_error': item.get('entry_error') if isinstance(item.get('entry_error'), dict) else None,
     }
 
 
@@ -9302,7 +9408,16 @@ def _process_backtest_trade_tick(
                     re_kind = ('lazy' if 'NextLeg' in re_type else
                                'immediate' if 'Immediate' in re_type else
                                'at_cost' if 'AtCost' in re_type else 'like_original')
-                    new_leg_id = str((reentry_cfg.get('Value') or {}).get('NextLegRef') or '')
+                    # NextLegRef only applies to the lazy kind — Immediate/AtCost/
+                    # LikeOriginal instead build their new leg id as
+                    # f'{orig_id}_re_{now_ts...}' inside _handle_reentry (see
+                    # its Immediate/AtCost/LikeOriginal branches); reconstruct
+                    # the same deterministic id here so the audit-trail row
+                    # isn't left blank for those three reentry kinds.
+                    new_leg_id = (
+                        str((reentry_cfg.get('Value') or {}).get('NextLegRef') or '') if re_kind == 'lazy'
+                        else f'{leg_id}_re_{now_ts.replace(":", "").replace("T", "")}'
+                    )
                     record_reentry_queued(db._db, trade, now_ts, leg_id, re_kind, new_leg_id, re_type, reason='sl')
                     mark_strategy_activity(trade, 'reentry', {
                         'leg_id': leg_id, 'reason': 'sl', 'reentry_type': re_type,
@@ -9344,7 +9459,16 @@ def _process_backtest_trade_tick(
                     re_kind = ('lazy' if 'NextLeg' in re_type else
                                'immediate' if 'Immediate' in re_type else
                                'at_cost' if 'AtCost' in re_type else 'like_original')
-                    new_leg_id = str((reentry_cfg.get('Value') or {}).get('NextLegRef') or '')
+                    # NextLegRef only applies to the lazy kind — Immediate/AtCost/
+                    # LikeOriginal instead build their new leg id as
+                    # f'{orig_id}_re_{now_ts...}' inside _handle_reentry (see
+                    # its Immediate/AtCost/LikeOriginal branches); reconstruct
+                    # the same deterministic id here so the audit-trail row
+                    # isn't left blank for those three reentry kinds.
+                    new_leg_id = (
+                        str((reentry_cfg.get('Value') or {}).get('NextLegRef') or '') if re_kind == 'lazy'
+                        else f'{leg_id}_re_{now_ts.replace(":", "").replace("T", "")}'
+                    )
                     record_reentry_queued(db._db, trade, now_ts, leg_id, re_kind, new_leg_id, re_type, reason='target')
                     mark_strategy_activity(trade, 'reentry', {
                         'leg_id': leg_id, 'reason': 'target', 'reentry_type': re_type,
@@ -10959,7 +11083,14 @@ def _live_minute_tick(db: MongoData, trade_date: str) -> dict:
                         re_kind = ('lazy' if 'NextLeg' in re_type else
                                    'immediate' if 'Immediate' in re_type else
                                    'at_cost' if 'AtCost' in re_type else 'like_original')
-                        new_leg_id = str((reentry_cfg.get('Value') or {}).get('NextLegRef') or '')
+                        # NextLegRef only applies to the lazy kind — the other
+                        # three reentry kinds build their id as
+                        # f'{orig_id}_re_{now_ts...}' inside _handle_reentry;
+                        # reconstruct the same id here for the audit trail.
+                        new_leg_id = (
+                            str((reentry_cfg.get('Value') or {}).get('NextLegRef') or '') if re_kind == 'lazy'
+                            else f'{leg_id}_re_{now_ts.replace(":", "").replace("T", "")}'
+                        )
                         record_reentry_queued(db._db, trade, now_ts, leg_id, re_kind, new_leg_id, re_type, reason='sl')
                         if 'AtCost' in re_type:
                             try:
@@ -11007,7 +11138,14 @@ def _live_minute_tick(db: MongoData, trade_date: str) -> dict:
                         re_kind = ('lazy' if 'NextLeg' in re_type else
                                    'immediate' if 'Immediate' in re_type else
                                    'at_cost' if 'AtCost' in re_type else 'like_original')
-                        new_leg_id = str((reentry_cfg.get('Value') or {}).get('NextLegRef') or '')
+                        # NextLegRef only applies to the lazy kind — the other
+                        # three reentry kinds build their id as
+                        # f'{orig_id}_re_{now_ts...}' inside _handle_reentry;
+                        # reconstruct the same id here for the audit trail.
+                        new_leg_id = (
+                            str((reentry_cfg.get('Value') or {}).get('NextLegRef') or '') if re_kind == 'lazy'
+                            else f'{leg_id}_re_{now_ts.replace(":", "").replace("T", "")}'
+                        )
                         record_reentry_queued(db._db, trade, now_ts, leg_id, re_kind, new_leg_id, re_type, reason='target')
                         if 'AtCost' in re_type:
                             try:

@@ -88,10 +88,14 @@ def resolve_expiry(
     option_type: str,
     trade_date: str,
     snapshot_timestamp: str | None = None,
+    expiry_kind: str = 'ExpiryType.Weekly',
 ) -> tuple[str, str | None]:
     """
-    Find the nearest expiry >= trade_date that has data in the option chain.
-    Returns (expiry, error_reason).  error_reason is None on success.
+    Find the expiry >= trade_date that has data in the option chain, honoring
+    expiry_kind (Weekly/NextWeekly/Monthly/NextMonthly) — same classification
+    execution_socket._resolve_expiry_from_tokens uses for the live path, so a
+    leg configured for e.g. Monthly doesn't silently corrupt to nearest-weekly
+    here. Returns (expiry, error_reason). error_reason is None on success.
     """
     try:
         base_q = {
@@ -100,23 +104,28 @@ def resolve_expiry(
             'expiry': {'$gte': trade_date},
         }
         if snapshot_timestamp:
-            doc = chain_col.find_one(
-                {**base_q, 'timestamp': snapshot_timestamp},
-                sort=[('expiry', 1)],
-            )
-            if not doc:
-                doc = chain_col.find_one(
-                    {**base_q, 'timestamp': {'$lte': snapshot_timestamp}},
-                    sort=[('expiry', 1), ('timestamp', DESCENDING)],
-                )
+            raw_expiries = chain_col.distinct('expiry', {**base_q, 'timestamp': snapshot_timestamp})
+            if not raw_expiries:
+                raw_expiries = chain_col.distinct('expiry', {**base_q, 'timestamp': {'$lte': snapshot_timestamp}})
         else:
-            doc = chain_col.find_one(
-                {**base_q, 'timestamp': {'$regex': f'^{trade_date}'}},
-                sort=[('expiry', 1), ('timestamp', DESCENDING)],
-            )
-        if not doc:
+            raw_expiries = chain_col.distinct('expiry', {**base_q, 'timestamp': {'$regex': f'^{trade_date}'}})
+
+        expiries = sorted({str(e)[:10] for e in (raw_expiries or []) if e})
+        if not expiries:
             return '', 'no_expiry_data'
-        return str(doc.get('expiry') or ''), None
+
+        kind = str(expiry_kind or 'ExpiryType.Weekly')
+        if 'Monthly' in kind:
+            monthly: list[str] = []
+            from itertools import groupby
+            for _month_key, group in groupby(expiries, key=lambda d: d[:7]):
+                monthly.append(list(group)[-1])
+            chosen = (monthly[1] if len(monthly) > 1 else monthly[0]) if 'NextMonthly' in kind else monthly[0]
+        elif 'NextWeekly' in kind:
+            chosen = expiries[1] if len(expiries) > 1 else expiries[0]
+        else:
+            chosen = expiries[0]
+        return chosen, None
     except Exception as exc:
         return '', f'expiry_query_error:{exc}'
 

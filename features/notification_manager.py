@@ -22,6 +22,8 @@ Event types
     lock_and_trail_exit      — LockAndTrail / Lock profit floor triggered exit
     overall_reentry_queued   — original legs re-queued after OverallReentrySL/Tgt
     force_exit               — leg closed at exit_time, overall_sl, overall_target, or lock_and_trail
+    entry_blocked            — pending leg could not be entered this tick (missing expiry/
+                                strike/chain-price/spot, or an unexpected resolution error)
 
 Document structure (every event)
 ──────────────────────────────────
@@ -98,6 +100,10 @@ force_exit:
     strike, option_type, entry_price,
     exit_price, exit_reason, pnl
     (exit_reason: exit_time | overall_sl | overall_target | lock_and_trail)
+
+entry_blocked:
+    reason (e.g. expiry_missing, chain_empty, strike_missing, resolve_exception),
+    message, option_type, expiry_kind, strike_parameter
 """
 
 from __future__ import annotations
@@ -251,6 +257,13 @@ def _build_what_happened(event_type: str, data: dict) -> str:
             f"Leg P&L: {d.get('pnl')}"
         )
 
+    if et == 'entry_blocked':
+        return (
+            f"Entry could not be taken for {d.get('option_type') or '?'} "
+            f"({d.get('strike_parameter') or d.get('expiry_kind') or ''}). "
+            f"Reason: {d.get('reason')}. {d.get('message') or ''}"
+        ).strip()
+
     return ''
 
 
@@ -377,6 +390,40 @@ def record_entry_taken(
         'overall_sl_value':  overall_sl_value,
         'overall_tgt_type':  overall_tgt_type,
         'overall_tgt_value': overall_tgt_value,
+    }
+    _push_notification(db, doc)
+
+
+def record_entry_blocked(
+    db,
+    trade: dict,
+    leg_id: str,
+    reason: str,
+    message: str,
+    timestamp: str,
+    option_type: str = '',
+    expiry_kind: str = '',
+    strike_parameter: Any = None,
+) -> None:
+    """
+    Record that a pending leg's entry could not be taken this tick.
+    One document per (leg_id, reason) per _DEDUP_WINDOW-ish burst is NOT
+    enforced here — callers are expected to only call this on state change
+    (new reason, or first occurrence) to avoid flooding the history with a
+    duplicate row every retry tick.
+    """
+    meta = _trade_meta(trade)
+    trade_id = str(trade.get('_id') or '')
+    doc = _base(
+        meta['strategy_id'], trade_id, 'entry_blocked', timestamp,
+        meta['strategy_name'], meta['ticker'], leg_id=leg_id,
+    )
+    doc['data'] = {
+        'reason':           reason,
+        'message':          message,
+        'option_type':      option_type,
+        'expiry_kind':      expiry_kind,
+        'strike_parameter': strike_parameter,
     }
     _push_notification(db, doc)
 

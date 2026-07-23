@@ -194,6 +194,13 @@ class MongoData:
                         serverSelectionTimeoutMS=5000,
                         event_listeners=[self._command_logger],
                         appname="option-algo",
+                        # Explicit (not relying on the pymongo default) so it's
+                        # sized deliberately against the batch entry-processing
+                        # worker pool (see _MOMENTUM_BATCH_MAX_WORKERS in
+                        # live_tick_dispatcher.py) plus headroom for this same
+                        # process's normal API request handling.
+                        maxPoolSize=150,
+                        minPoolSize=10,
                     )
                     self._client_cache[uri] = cached_client
                     created_new_client = True
