@@ -239,35 +239,97 @@ class DhanAdapter:
 
     def quote(self, symbols: list) -> dict:
         """
-        Kite-shaped quote dict, last_price only — Dhan's quote feed isn't pulled for
-        bid/ask depth in this codebase yet, so depth comes back empty. Callers
-        (_get_bid_ask / _get_aggressive_exit_price in live_order_manager.py) already
-        fall back to last_price when depth is empty, so this degrades safely.
-        """
-        from features.broker_gateway import get_broker_rest_quotes
+        Kite-shaped quote dict with REAL depth (price+quantity per level), not just
+        last_price. Previously always returned 'depth': {'buy': [], 'sell': []} — every
+        MPP order for a Dhan-executed live/Advanced-execution leg (_get_bid_ask/
+        _get_market_depth/_walk_depth_for_qty in live_order_manager.py, all broker-agnostic
+        and unchanged, they just call broker.quote()) silently aborted with "no live depth,
+        order NOT placed" because of that stub, even though the same walked-depth+quantity
+        pricing already worked for Dhan via the manual Order Pad flow
+        (_resolve_mpp_price/_fetch_dhan_market_data in algo.simulator/api.py and
+        algo.trade/api.py) — this ports that same WS-first/REST-fallback depth fetch here so
+        the live/webhook execution path gets it too, without touching either of those.
 
-        token_map: dict[str, str] = {}
+        WS-first (dhan_ticker_manager.bid_map/ask_map/bid_qty_map/ask_qty_map — instant,
+        no REST, but only ever level-0/best price+qty, same limit the WS binary parser has
+        everywhere else in this codebase). REST fallback (/marketfeed/quote, rate-gated via
+        dhan_quote_post_blocking) for anything missing from WS — returns the full depth
+        Dhan sends (typically 5 levels each side), letting _walk_depth_for_qty walk past
+        level 0 for a quantity bigger than the top level alone holds.
+        """
+        from features.broker_gateway import dhan_quote_post_blocking
+        from features.dhan_ticker import dhan_ticker_manager as _dtm
+
+        # sym_key ("EXCH:TRADINGSYMBOL") -> (security_id, exchange_segment)
+        resolved: dict[str, tuple[str, str]] = {}
         for sym_key in symbols or []:
             parts = sym_key.split(':', 1)
-            tsym = parts[1] if len(parts) == 2 else parts[0]
+            exch, tsym = (parts[0], parts[1]) if len(parts) == 2 else ('', parts[0])
             doc = self.db._db['active_option_tokens'].find_one({'broker': 'dhan', 'symbol': tsym}) or {}
-            token = str(doc.get('token') or '').strip()
-            if token:
-                token_map[token] = sym_key
-        if not token_map:
+            token = str(doc.get('token') or doc.get('tokens') or '').strip()
+            if not token:
+                continue
+            segment = str(doc.get('ws_segment') or '').strip().upper() or ('BSE_FNO' if exch.upper() == 'BSE' else 'NSE_FNO')
+            resolved[sym_key] = (token, segment)
+        if not resolved:
             return {}
 
-        quotes = get_broker_rest_quotes(list(token_map.keys()), self.db._db)
         result: dict = {}
-        for token, sym_key in token_map.items():
-            q = quotes.get(token) or {}
-            lp = float(q.get('ltp') or 0)
-            result[sym_key] = {
-                'last_price': lp,
-                'upper_circuit': 0.0,
-                'lower_circuit': 0.0,
-                'depth': {'buy': [], 'sell': []},
-            }
+        missing_by_segment: dict[str, list[int]] = {}
+        for sym_key, (token, segment) in resolved.items():
+            ws_bid = float(_dtm.bid_map.get(token) or 0)
+            ws_ask = float(_dtm.ask_map.get(token) or 0)
+            if ws_bid > 0 or ws_ask > 0:
+                result[sym_key] = {
+                    'last_price': float(_dtm.ltp_map.get(token) or 0),
+                    'upper_circuit': 0.0,
+                    'lower_circuit': 0.0,
+                    'depth': {
+                        'buy':  [{'price': ws_bid, 'quantity': int(_dtm.bid_qty_map.get(token) or 0)}] if ws_bid > 0 else [],
+                        'sell': [{'price': ws_ask, 'quantity': int(_dtm.ask_qty_map.get(token) or 0)}] if ws_ask > 0 else [],
+                    },
+                }
+            else:
+                try:
+                    missing_by_segment.setdefault(segment, []).append(int(token))
+                except ValueError:
+                    continue
+
+        if missing_by_segment:
+            try:
+                resp = dhan_quote_post_blocking(missing_by_segment, self.access_token, self.client_id, timeout=10.0)
+                if resp is not None and resp.status_code == 200:
+                    raw = resp.json()
+                    data = raw.get('data') or raw
+                    token_to_sym_key = {tok: sk for sk, (tok, _seg) in resolved.items()}
+                    for segment_data in data.values():
+                        if not isinstance(segment_data, dict):
+                            continue
+                        for tok, info in segment_data.items():
+                            sym_key = token_to_sym_key.get(str(tok))
+                            if not sym_key or not isinstance(info, dict):
+                                continue
+                            depth = info.get('depth') or {}
+
+                            def _levels(raw_levels: list) -> list[dict]:
+                                return [
+                                    {'price': float(lvl.get('price') or 0), 'quantity': int(lvl.get('quantity') or 0)}
+                                    for lvl in (raw_levels or []) if float(lvl.get('price') or 0) > 0
+                                ]
+
+                            result[sym_key] = {
+                                'last_price': float(info.get('last_price') or 0),
+                                'upper_circuit': 0.0,
+                                'lower_circuit': 0.0,
+                                'depth': {'buy': _levels(depth.get('buy')), 'sell': _levels(depth.get('sell'))},
+                            }
+            except Exception as exc:
+                log.warning('[DHAN QUOTE] depth REST fetch failed: %s', exc)
+
+        # Any symbol still unresolved (WS empty AND REST missed/failed) gets an
+        # empty-depth entry — callers already treat that as "no live depth", not a KeyError.
+        for sym_key in resolved:
+            result.setdefault(sym_key, {'last_price': 0.0, 'upper_circuit': 0.0, 'lower_circuit': 0.0, 'depth': {'buy': [], 'sell': []}})
         return result
 
 

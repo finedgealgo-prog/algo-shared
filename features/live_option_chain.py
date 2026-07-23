@@ -246,21 +246,37 @@ def fetch_full_chain(
     expiry: str,
     spot_price: float,
     leg_id: str = '',
+    strike_window: int = 0,
 ) -> dict[str, list[dict]]:
     """
-    Fetch ALL strikes for the expiry from Kite (both CE and PE).
-    Computes Black-Scholes IV + Greeks for each row.
-    Prints the combined CE/PE chain table.
-    Returns {'CE': [rows], 'PE': [rows]}.
+    Fetch strikes for the expiry from Kite/Dhan (both CE and PE). Computes
+    Black-Scholes IV + Greeks for each row. Returns {'CE': [rows], 'PE': [rows]}.
+
+    strike_window: 0 (default) = every strike, unchanged behavior for every
+    existing caller (trade execution, IV scanning, etc. — these need the real
+    full chain, never pass this). >0 = only the N strikes nearest spot on each
+    side of CE/PE — for UI chain views (live_greeks_chain_socket.py), where a
+    user is looking at maybe 20-30 strikes around ATM at a time, fetching
+    quotes+depth for every strike in the expiry (worst case: a monthly index
+    expiry with 100+ strikes, all cold — never mind an F&O stock's whole
+    listed range) was paying Dhan's shared REST rate gate for rows nobody
+    was going to see, which is what made a cold/far-month expiry take
+    seconds-to-never instead of the ~50ms a broker's own chain view manages
+    (they're not rate-limiting themselves against their own feed).
 
     Results are cached for 2 seconds so multiple code paths in the same tick
-    share one Kite REST call instead of each fetching independently.
+    share one REST call instead of each fetching independently. strike_window
+    is part of the cache key — a windowed result must never satisfy a caller
+    that asked for (or previously got) the full chain, and vice versa.
     """
-    _cache_key = (underlying, expiry)
+    _cache_key = (underlying, expiry, strike_window)
+    _fc_t0 = time.perf_counter()
 
     # Fast path: valid cache hit (no lock needed for read)
     _cached = _cache_get(_cache_key)
     if _cached is not None:
+        print(f'[CHAIN-TIMING] {underlying}|{expiry} fetch_full_chain cache HIT: '
+              f'{(time.perf_counter() - _fc_t0) * 1000:.1f}ms', flush=True)
         return _cached
 
     # Serialize concurrent fetches for the same (underlying, expiry) key.
@@ -280,11 +296,16 @@ def fetch_full_chain(
     if not _is_fetcher:
         _wait_ev.wait(timeout=10.0)
         _cached = _cache_get(_cache_key)
+        print(f'[CHAIN-TIMING] {underlying}|{expiry} fetch_full_chain WAITED on another '
+              f'in-flight fetch: {(time.perf_counter() - _fc_t0) * 1000:.1f}ms', flush=True)
         if _cached is not None:
             return _cached
         return {'CE': [], 'PE': []}
 
+    print(f'[CHAIN-TIMING] {underlying}|{expiry} fetch_full_chain cache MISS — strike_window={strike_window} '
+          f'(0 = full/unwindowed chain, every strike pays the Dhan rate gate)', flush=True)
     # We are the fetcher — route to correct broker.
+    _broker = '?'
     try:
         try:
             from features.broker_gateway import _active_broker  # type: ignore
@@ -294,16 +315,18 @@ def fetch_full_chain(
 
         if _broker == 'dhan':
             try:
-                return _fetch_full_chain_from_dhan(db, underlying, expiry, spot_price, leg_id)
+                return _fetch_full_chain_from_dhan(db, underlying, expiry, spot_price, leg_id, strike_window)
             except Exception as exc:
                 log.warning('[DHAN CHAIN] leg=%s chain fetch error underlying=%s expiry=%s: %s',
                             leg_id, underlying, expiry, exc)
                 return {'CE': [], 'PE': []}
 
         return _fetch_full_chain_from_kite(
-            db, underlying, expiry, spot_price, leg_id,
+            db, underlying, expiry, spot_price, leg_id, strike_window,
         )
     finally:
+        print(f'[CHAIN-TIMING] {underlying}|{expiry} fetch_full_chain TOTAL (broker={_broker}): '
+              f'{(time.perf_counter() - _fc_t0) * 1000:.1f}ms', flush=True)
         with _CHAIN_MUTEX:
             _CHAIN_FETCHING.pop(_cache_key, None)
         _wait_ev.set()
@@ -315,6 +338,7 @@ def _fetch_full_chain_from_dhan(
     expiry: str,
     spot_price: float,
     leg_id: str,
+    strike_window: int = 0,
 ) -> dict[str, list[dict]]:
     """
     Fetch option chain for Dhan broker.
@@ -323,8 +347,22 @@ def _fetch_full_chain_from_dhan(
       2. Dhan REST POST /v2/marketfeed/ltp (fallback when WS data absent)
     Spot comes from broker_ticker_manager.spot_map.
     Contracts come from active_option_tokens (broker=dhan).
+
+    strike_window: see fetch_full_chain's docstring — trims `contracts` down to
+    the N strikes nearest spot on each side BEFORE the REST quote+depth fetch
+    below, so a cold/wide expiry only pays Dhan's rate gate for the strikes a
+    chain view is actually about to show.
     """
-    _cache_key = (underlying, expiry)
+    _cache_key = (underlying, expiry, strike_window)
+    # [CHAIN-TIMING] sub-step breakdown for the Dhan path — this is the part that
+    # actually pays Mongo queries + Dhan's shared REST rate gate. Diagnostic-only.
+    _dt0 = time.perf_counter()
+
+    def _dlap(label: str, _t_prev: list[float] = [_dt0]) -> None:
+        now = time.perf_counter()
+        print(f'[CHAIN-TIMING]   {underlying}|{expiry} dhan.{label}: {(now - _t_prev[0]) * 1000:.1f}ms', flush=True)
+        _t_prev[0] = now
+
     (
         _calc_iv, _calc_greeks, _time_to_expiry,
         _get_kite_credentials, _RISK_FREE_RATE, _DIVIDEND_YIELDS, _DEFAULT_DIVIDEND_YIELD,
@@ -338,6 +376,7 @@ def _fetch_full_chain_from_dhan(
             spot_price = ws_spot
     except Exception:
         pass
+    _dlap('resolve_ws_spot')
 
     # ── 2. Contracts from active_option_tokens (broker=dhan) ──────────────────
     contracts: list[dict] = []
@@ -353,14 +392,39 @@ def _fetch_full_chain_from_dhan(
         ))
     except Exception as exc:
         log.warning('[DHAN CHAIN] leg=%s active_option_tokens error: %s', leg_id, exc)
+    _dlap(f'mongo_contracts_query (found {len(contracts)})')
 
     if not contracts:
         log.warning('[DHAN CHAIN] leg=%s no contracts found underlying=%s expiry=%s',
                     leg_id, underlying, expiry)
         return {'CE': [], 'PE': []}
 
+    # strike_window: keep only the N distinct strikes nearest spot on each side, per
+    # option_type (CE/PE tracked separately since a stock's listed strikes can be
+    # asymmetric around spot) — before the expensive quote+depth fetch below, not after,
+    # so the rate-limited REST call itself gets smaller, not just the response.
+    if strike_window > 0 and spot_price > 0:
+        by_side: dict[str, list[float]] = {}
+        for c in contracts:
+            side = str(c.get('option_type') or '').upper()
+            strike = float(c.get('strike') or 0)
+            if strike > 0:
+                by_side.setdefault(side, []).append(strike)
+        keep_strikes: dict[str, set[float]] = {}
+        for side, strikes in by_side.items():
+            uniq = sorted(set(strikes))
+            nearest_idx = min(range(len(uniq)), key=lambda i: abs(uniq[i] - spot_price))
+            lo = max(0, nearest_idx - strike_window)
+            hi = min(len(uniq), nearest_idx + strike_window + 1)
+            keep_strikes[side] = set(uniq[lo:hi])
+        contracts = [
+            c for c in contracts
+            if float(c.get('strike') or 0) in keep_strikes.get(str(c.get('option_type') or '').upper(), set())
+        ]
+
     ce_count = sum(1 for c in contracts if str(c.get('option_type') or '').upper() == 'CE')
     pe_count = sum(1 for c in contracts if str(c.get('option_type') or '').upper() == 'PE')
+    _dlap(f'strike_window_filter (CE={ce_count} PE={pe_count} strike_window={strike_window})')
     # [DHAN CHAIN] underlying/expiry print suppressed
 
     # ── 3. LTP + OI via broker_gateway (WS first, REST /marketfeed/quote fallback) ──
@@ -393,6 +457,7 @@ def _fetch_full_chain_from_dhan(
             _btm_warm.warm_chain_tokens(_ids, _seg)
     except Exception as exc:
         log.warning('[DHAN CHAIN] leg=%s chain warm error: %s', leg_id, exc)
+    _dlap(f'warm_chain_tokens ({len(all_tok_ids)} tokens)')
 
     broker_quotes: dict[str, dict] = {}
     try:
@@ -401,6 +466,7 @@ def _fetch_full_chain_from_dhan(
     except Exception as exc:
         log.warning('[DHAN CHAIN] leg=%s broker_quotes error: %s', leg_id, exc)
     ltp_count = sum(1 for v in broker_quotes.values() if v.get('ltp', 0) > 0)
+    _dlap(f'get_broker_rest_quotes (ltp resolved for {ltp_count}/{len(all_tok_ids)}) <-- likely bottleneck: Dhan rate gate')
     # [DHAN CHAIN] quotes print suppressed
 
     # ── 3c. Depth (bid/ask) + previous-day baseline (for oi/ltp change%) ──────
@@ -413,6 +479,7 @@ def _fetch_full_chain_from_dhan(
     # previous-day baseline is a once-per-session Mongo read (long-TTL
     # cached in this module), unrelated to either.
     broker_depth: dict[str, dict] = {}
+    _missing_depth: list[str] = []
     try:
         from features.broker_gateway import get_broker_ws_depth, get_broker_rest_depth  # type: ignore
         broker_depth = get_broker_ws_depth(all_tok_ids)
@@ -421,7 +488,9 @@ def _fetch_full_chain_from_dhan(
             broker_depth.update(get_broker_rest_depth(_missing_depth, db._db, ws_segments))
     except Exception as exc:
         log.warning('[DHAN CHAIN] leg=%s broker_depth error: %s', leg_id, exc)
+    _dlap(f'broker_depth (ws_hit={len(broker_depth) - len(_missing_depth)}, rest_fallback={len(_missing_depth)})')
     baseline = _resolve_previous_day_baseline(db._db, str(underlying or '').strip().upper(), expiry)
+    _dlap('resolve_previous_day_baseline')
 
     # ── 3b. Commodity fallback: options-on-futures have no index "spot" ──────
     # (no market_feed_tokens "spot" entry for MCX underlyings), so spot_map
@@ -514,11 +583,13 @@ def _fetch_full_chain_from_dhan(
 
     chain['CE'].sort(key=lambda r: _safe_float(r.get('strike')))
     chain['PE'].sort(key=lambda r: _safe_float(r.get('strike')))
+    _dlap(f'build_rows_iv_greeks ({len(contracts)} contracts)')
 
     ltp_count = sum(1 for row in chain['CE'] + chain['PE'] if row.get('ltp', 0) > 0)
     # [DHAN CHAIN] chain_built print suppressed
     # _print_combined_table suppressed
     _cache_set(_cache_key, chain)
+    print(f'[CHAIN-TIMING]   {underlying}|{expiry} dhan.TOTAL: {(time.perf_counter() - _dt0) * 1000:.1f}ms', flush=True)
     return chain
 
 
@@ -528,8 +599,9 @@ def _fetch_full_chain_from_kite(
     expiry: str,
     spot_price: float,
     leg_id: str,
+    strike_window: int = 0,
 ) -> dict[str, list[dict]]:
-    _cache_key = (underlying, expiry)
+    _cache_key = (underlying, expiry, strike_window)
     (
         _calc_iv,
         _calc_greeks,
@@ -564,6 +636,26 @@ def _fetch_full_chain_from_kite(
         log.warning('[LIVE CHAIN] leg=%s no contracts found underlying=%s expiry=%s',
                     leg_id, underlying, expiry)
         return {'CE': [], 'PE': []}
+
+    # strike_window: see fetch_full_chain's docstring / the Dhan fetcher's identical block.
+    if strike_window > 0 and spot_price > 0:
+        by_side: dict[str, list[float]] = {}
+        for c in contracts:
+            side = str(c.get('option_type') or '').strip().upper()
+            strike = float(c.get('strike') or 0)
+            if strike > 0:
+                by_side.setdefault(side, []).append(strike)
+        keep_strikes: dict[str, set[float]] = {}
+        for side, strikes in by_side.items():
+            uniq = sorted(set(strikes))
+            nearest_idx = min(range(len(uniq)), key=lambda i: abs(uniq[i] - spot_price))
+            lo = max(0, nearest_idx - strike_window)
+            hi = min(len(uniq), nearest_idx + strike_window + 1)
+            keep_strikes[side] = set(uniq[lo:hi])
+        contracts = [
+            c for c in contracts
+            if float(c.get('strike') or 0) in keep_strikes.get(str(c.get('option_type') or '').strip().upper(), set())
+        ]
 
     ce_count = sum(1 for c in contracts if str(c.get('option_type') or '').strip().upper() == 'CE')
     pe_count = sum(1 for c in contracts if str(c.get('option_type') or '').strip().upper() == 'PE')

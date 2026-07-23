@@ -1733,6 +1733,8 @@ def check_broker_sl_target(
                         ctx.db._db[COL_BROKER_SL].update_one(
                             {'_id': _settings_id}, {'$set': _sl_state_upd}
                         )
+                        from features.execution_socket import mark_broker_settings_dirty  # type: ignore
+                        mark_broker_settings_dirty(_uid, _mode)
                     except Exception as exc:
                         log.warning('[SL TRAIL STATE] save error: %s', exc)
                 print('[BROKER SL TRAIL CHECK]', {
@@ -1820,6 +1822,11 @@ def check_broker_sl_target(
             # Step 3 — disable settings (status → 0) so next tick skips
             disable_broker_sl_settings(ctx.db, _uid, _bkr, _mode)
             print(f'  [BROKER {reason}] settings disabled user={_uid[:8]}.. broker={_bkr[:8]}..')
+            try:
+                from features.execution_socket import mark_broker_settings_dirty  # type: ignore
+                mark_broker_settings_dirty(_uid, _mode)
+            except Exception as exc:
+                log.warning('[BROKER %s] mark_broker_settings_dirty error: %s', reason, exc)
             ctx.actions_taken.append(
                 f'broker_{reason.lower().replace(" ", "_")} broker={_bkr} mtm={total_mtm}'
             )
@@ -2023,6 +2030,8 @@ def check_broker_sl_target(
                         {'_id': _settings_id},
                         _mongo_op,
                     )
+                    from features.execution_socket import mark_broker_settings_dirty  # type: ignore
+                    mark_broker_settings_dirty(_uid, _mode)
             except Exception as exc:
                 log.warning('[LOCK STATE] save error: %s', exc)
 
