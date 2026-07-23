@@ -1806,7 +1806,7 @@ def check_broker_sl_target(
             # Step 1 — close open-leg trades at current LTP
             for t in open_trades:
                 fresh = ctx.db._db[COL_ALGO_TRADES].find_one({'_id': t['_id']}) or t
-                square_off_trade(ctx.db, fresh, ctx.now_ts, market_cache=ctx.market_cache)
+                square_off_trade(ctx.db, fresh, ctx.now_ts, market_cache=ctx.market_cache, dispatch_live_orders=True)
                 trade_event_print(f'  [BROKER {reason}] trade={str(t.get("_id") or "")[:16]} closed')
             # Step 2 — bulk-close all pending/import trades under this broker
             try:
@@ -2476,12 +2476,58 @@ def mark_trade_squared_off(db: MongoData, trade_id: str) -> None:
         log.error('mark_trade_squared_off error trade=%s: %s', trade_id, exc)
 
 
+def _dispatch_live_square_off_order(
+    db: MongoData,
+    trade_id: str,
+    leg_id: str,
+    exit_price: float,
+    exit_reason: str,
+) -> None:
+    """
+    Fire the real broker exit order for one live leg closed by square_off_trade().
+
+    trading_core's own close_leg_in_db() only ever writes Mongo — it's shared
+    with backtest, which must never touch a broker. Only callers that already
+    know they're closing a *live* trade (e.g. check_broker_sl_target's _fire())
+    should invoke this, right after the DB close, to reuse the exact same
+    cancel-then-place dispatch (off the live tick thread) that leg-level and
+    overall-level SL/TP already use — see execution_socket._dispatch_mode_exit_order.
+    """
+    if not leg_id:
+        return
+    try:
+        from features.execution_socket import (  # local import: avoids circular import (execution_socket imports trading_core at module load)
+            _dispatch_mode_exit_order,
+            _resolve_leg_cfg,
+            _resolve_trade_leg_configs,
+        )
+        hist = db._db[COL_POSITIONS_HIST].find_one(
+            {'trade_id': trade_id, 'leg_id': leg_id},
+            {'symbol': 1, 'quantity': 1, 'lot_size': 1},
+        ) or {}
+        symbol = str(hist.get('symbol') or '').strip()
+        # quantity stored is lot count, not contracts — broker exit order needs
+        # the actual contract count (same convention as execution_socket.close_leg_in_db).
+        qty = int(hist.get('quantity') or 1) * max(1, int(hist.get('lot_size') or 1))
+        trade = db._db[COL_ALGO_TRADES].find_one({'_id': trade_id}) or {}
+        leg = next(
+            (l for l in (trade.get('legs') or [])
+             if isinstance(l, dict) and str(l.get('id') or '') == leg_id),
+            {},
+        )
+        leg_cfg = _resolve_leg_cfg(leg_id, leg, _resolve_trade_leg_configs(trade))
+        _dispatch_mode_exit_order(db, trade, leg, leg_cfg, symbol, qty, exit_price, exit_reason)
+    except Exception as exc:
+        log.error('[BROKER SQUARE OFF] live exit dispatch error trade=%s leg=%s: %s', trade_id, leg_id, exc)
+
+
 def square_off_trade(
     db: MongoData,
     trade_rec: dict,
     exit_timestamp: str,
     *,
     market_cache: dict | None = None,
+    dispatch_live_orders: bool = False,
 ) -> bool:
     """
     Square off ALL open legs in a trade at current LTP.
@@ -2499,6 +2545,12 @@ def square_off_trade(
       - Manual square-off from frontend (squared-off socket message)
       - Overall SL/Target hit → _bt_close_remaining()
       - Broker-level SL/Target hit → check_broker_sl_target()
+
+    dispatch_live_orders: when True AND trade_rec.activation_mode == 'live',
+    also fires a real broker exit order per closed leg (see
+    _dispatch_live_square_off_order). Defaults to False so backtest and the
+    other pre-existing callers of this function keep their current DB-only
+    behavior unchanged.
     """
     t_id = str((trade_rec or {}).get('_id') or '').strip()
     if not t_id:
@@ -2512,6 +2564,7 @@ def square_off_trade(
         or ''
     )
     activation_mode = str(trade_rec.get('activation_mode') or '').strip()
+    live_dispatch = bool(dispatch_live_orders) and activation_mode == 'live'
     all_open_closed = True
 
     def _live_ltp(token: str) -> float:
@@ -2552,6 +2605,8 @@ def square_off_trade(
 
         close_leg_in_db(db, t_id, idx, exit_price, 'squared_off', exit_timestamp, leg_id=leg_id)
         trade_event_print(f'  [SQUARE OFF] leg={leg_id} token={token} price={exit_price} mode={activation_mode}')
+        if live_dispatch:
+            _dispatch_live_square_off_order(db, t_id, leg_id, exit_price, 'squared_off')
 
     # ── Close legs already in position history (string refs) ─────────────
     history_open = list(history_col.find({'trade_id': t_id, 'status': OPEN_LEG_STATUS}))
@@ -2588,6 +2643,8 @@ def square_off_trade(
             all_open_closed = False
 
         trade_event_print(f'  [SQUARE OFF] closed leg trade={t_id} leg={leg_id} price={exit_price} ts={exit_timestamp}')
+        if live_dispatch:
+            _dispatch_live_square_off_order(db, t_id, leg_id, exit_price, 'squared_off')
 
     # ── Verify all legs are now closed ────────────────────────────────────
     refreshed   = algo_col.find_one({'_id': t_id}) or {}
