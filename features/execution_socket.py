@@ -7869,6 +7869,14 @@ def _fetch_dhan_broker_option_positions(
             realized_pnl = (
                 (exit_price - entry_price) if position == 'BUY' else (entry_price - exit_price)
             ) * quantity
+            print(
+                f'[EXITED-LEG DEBUG] token={token} position={position} '
+                f'buyQty={buy_qty} sellQty={sell_qty} '
+                f'carryForwardBuyQty={carry_forward_buy_qty} carryForwardSellQty={carry_forward_sell_qty} '
+                f'buyAvg={buy_avg} sellAvg={sell_avg} costPrice={cost_price} '
+                f'entry_price={entry_price} exit_price={exit_price} quantity={quantity} '
+                f'realized_pnl={realized_pnl}'
+            )
         else:
             realized_pnl = 0.0
         symbol = str(

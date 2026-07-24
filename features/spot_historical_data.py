@@ -139,22 +139,43 @@ def _fetch_kite_spot_vix(underlying: str, trade_date: str, candle_ts: str) -> di
     return result
 
 
-def get_spot_historical_data(
+def _normalize_range_ts(raw: str, *, is_end: bool = False) -> str:
+    """Pad a caller-supplied ISO timestamp out to 'YYYY-MM-DDTHH:MM:SS'."""
+    ts = str(raw or "").strip()
+    for sep in ("+", "Z"):
+        if sep in ts:
+            ts = ts.split(sep)[0].strip()
+    if "T" not in ts and " " in ts:
+        ts = ts.replace(" ", "T", 1)  # some callers send 'YYYY-MM-DD HH:MM:SS'
+
+    default_time = "15:30:00" if is_end else "09:15:00"
+    if "T" not in ts:
+        date_part = ts[:10] if len(ts) >= 10 else _date.today().isoformat()
+        return f"{date_part}T{default_time}"
+
+    date_part, time_part = ts.split("T", 1)
+    if len(date_part) != 10:
+        date_part = _date.today().isoformat()
+    if len(time_part) == 5:          # 'HH:MM'
+        time_part = f"{time_part}:00"
+    elif len(time_part) != 8:        # not 'HH:MM:SS' either
+        time_part = default_time
+    return f"{date_part}T{time_part}"
+
+
+def _fetch_spot_range(
     db,
     underlying: str,
-    candle: str,
-    activation_mode: str = "algo-backtest",
+    from_ts: str,
+    to_ts: str,
+    *,
+    kite_fallback: bool,
 ) -> dict:
     """
-    Returns { underlying_token: series, "NSE_00": vix_series }
-    Both series span 09:15 → candle timestamp on the trade date.
-
-    live / fast-forward → Kite historical_data API (real OHLCV)
-    algo-backtest       → DB option_chain_index_spot
+    Returns { underlying_token: series, "NSE_00": vix_series } for [from_ts, to_ts].
+    Shared body for both the candle-based and explicit-range public entry points.
     """
-    date_part, candle_ts = _parse_candle(candle)
-    market_open = f"{date_part}T09:15:00"
-    time_q = {"timestamp": {"$gte": market_open, "$lte": candle_ts}}
+    time_q = {"timestamp": {"$gte": from_ts, "$lte": to_ts}}
     col = db._db[SPOT_COL]
     result: dict = {}
 
@@ -172,7 +193,7 @@ def get_spot_historical_data(
         _set_underlying_series(result, ul, token, _to_series(spot_docs))
         log.info("[spot_hist] %s token=%s rows=%d", ul, token, len(spot_docs))
     else:
-        log.warning("[spot_hist] no data for underlying=%s date=%s", ul, date_part)
+        log.warning("[spot_hist] no data for underlying=%s range=%s..%s", ul, from_ts, to_ts)
 
     # ── India VIX (NSE_00) ──────────────────────────────────────────────────
     vix_docs = list(
@@ -186,15 +207,13 @@ def get_spot_historical_data(
         result[VIX_TOKEN] = _to_series(vix_docs)
         log.info("[spot_hist] VIX rows=%d", len(vix_docs))
     else:
-        log.warning("[spot_hist] no VIX data for date=%s", date_part)
+        log.warning("[spot_hist] no VIX data for range=%s..%s", from_ts, to_ts)
 
-    normalized_mode = str(activation_mode or "").strip().lower()
-    if normalized_mode == "algo-backtest":
-        return result
-    if has_spot and has_vix:
+    if not kite_fallback or (has_spot and has_vix):
         return result
 
-    kite_result = _fetch_kite_spot_vix(underlying, date_part, candle_ts)
+    trade_date = from_ts[:10]
+    kite_result = _fetch_kite_spot_vix(underlying, trade_date, to_ts)
     if not has_spot:
         for key, series in kite_result.items():
             if key != VIX_TOKEN:
@@ -202,3 +221,39 @@ def get_spot_historical_data(
     if not has_vix and VIX_TOKEN in kite_result:
         result[VIX_TOKEN] = kite_result[VIX_TOKEN]
     return result
+
+
+def get_spot_historical_data(
+    db,
+    underlying: str,
+    candle: str,
+    activation_mode: str = "algo-backtest",
+) -> dict:
+    """
+    Returns { underlying_token: series, "NSE_00": vix_series }
+    Both series span 09:15 → candle timestamp on the trade date.
+
+    live / fast-forward → Kite historical_data API (real OHLCV)
+    algo-backtest       → DB option_chain_index_spot
+    """
+    date_part, candle_ts = _parse_candle(candle)
+    market_open = f"{date_part}T09:15:00"
+    normalized_mode = str(activation_mode or "").strip().lower()
+    return _fetch_spot_range(db, underlying, market_open, candle_ts, kite_fallback=normalized_mode != "algo-backtest")
+
+
+def get_spot_historical_data_range(
+    db,
+    underlying: str,
+    start_dt: str,
+    end_dt: str,
+) -> dict:
+    """
+    Explicit-range twin of get_spot_historical_data — takes [start_dt, end_dt]
+    directly instead of "market open through one candle instant", mirroring
+    prices.algotest.in/historical's ?start_dt&end_dt contract. Always tries
+    DB first, then falls back to Kite (no algo-backtest-only short-circuit).
+    """
+    from_ts = _normalize_range_ts(start_dt, is_end=False)
+    to_ts = _normalize_range_ts(end_dt, is_end=True)
+    return _fetch_spot_range(db, underlying, from_ts, to_ts, kite_fallback=True)
