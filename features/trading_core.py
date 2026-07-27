@@ -93,10 +93,12 @@ from features.spot_atm_utils import (     # type: ignore
 # Position-manager: pure math, no DB side-effects
 from features.position_manager import (   # type: ignore
     # ── leg-level SL / TP ────────────────────────────────────────────────────
-    calc_sl_price,           # compute SL price from leg_cfg + entry_price
-    calc_tp_price,           # compute TP price from leg_cfg + entry_price
+    calc_sl_price,           # compute SL price from leg_cfg + entry_price/entry_spot
+    calc_tp_price,           # compute TP price from leg_cfg + entry_price/entry_spot
     is_sl_hit,               # bool: current_price hit SL threshold
     is_tp_hit,               # bool: current_price hit TP threshold
+    is_underlying_config,    # bool: SL/TP config is spot-based, not premium-based
+    underlying_direction_is_sell,  # bool: effective direction for spot-based SL/TP (CE/PE flip)
     check_leg_exit,          # unified: returns LegCheckResult(event, price)
     # ── trailing SL ──────────────────────────────────────────────────────────
     get_trail_config,        # parse LegTrailSL config from leg_cfg
@@ -1282,6 +1284,9 @@ def check_leg_sl(
     current_price: float,
     stored_sl: float | None,
     is_sell_position: bool,
+    entry_spot: float | None = None,
+    current_spot: float | None = None,
+    option_type: str | None = None,
 ) -> tuple[bool, float]:
     """
     Check if the current price has hit the leg's stop-loss.
@@ -1291,11 +1296,23 @@ def check_leg_sl(
     Delegates to position_manager.is_sl_hit() and calc_sl_price().
     The stored_sl (from DB) takes priority over a freshly computed one —
     this preserves manual SL updates and trail-SL moves.
+
+    For LegTgtSLType.UnderlyingPoints/UnderlyingPercentage, the trigger is
+    compared against current_spot (index spot), not the option's current_price —
+    entry_spot/current_spot must be supplied for those legs. option_type
+    ("CE"/"PE") is also required for underlying-based SL since the harmful
+    spot direction flips between CE and PE (see underlying_direction_is_sell).
     """
-    sl_price = stored_sl if stored_sl else calc_sl_price(entry_price, is_sell_position, leg_cfg.get('LegStopLoss') or {})
+    sl_config = leg_cfg.get('LegStopLoss') or {}
+    sl_price = stored_sl if stored_sl else calc_sl_price(entry_price, is_sell_position, sl_config, entry_spot, option_type)
     if not sl_price:
         return False, 0.0
-    hit = is_sl_hit(current_price, sl_price, is_sell_position)
+    is_underlying = is_underlying_config(sl_config)
+    compare_price = current_spot if is_underlying else current_price
+    if not compare_price:
+        return False, sl_price
+    direction = underlying_direction_is_sell(is_sell_position, option_type) if is_underlying else is_sell_position
+    hit = is_sl_hit(compare_price, sl_price, direction)
     return hit, sl_price
 
 
@@ -1305,16 +1322,30 @@ def check_leg_target(
     current_price: float,
     stored_tp: float | None,
     is_sell_position: bool,
+    entry_spot: float | None = None,
+    current_spot: float | None = None,
+    option_type: str | None = None,
 ) -> tuple[bool, float]:
     """
     Check if the current price has hit the leg's take-profit target.
 
     Returns (tp_hit: bool, tp_price: float).
+
+    For LegTgtSLType.UnderlyingPoints/UnderlyingPercentage, the trigger is
+    compared against current_spot (index spot), not the option's current_price —
+    entry_spot/current_spot must be supplied for those legs. option_type
+    ("CE"/"PE") is also required for underlying-based TP — see check_leg_sl.
     """
-    tp_price = stored_tp if stored_tp else calc_tp_price(entry_price, is_sell_position, leg_cfg.get('LegTarget') or {})
+    tp_config = leg_cfg.get('LegTarget') or {}
+    tp_price = stored_tp if stored_tp else calc_tp_price(entry_price, is_sell_position, tp_config, entry_spot, option_type)
     if not tp_price:
         return False, 0.0
-    hit = is_tp_hit(current_price, tp_price, is_sell_position)
+    is_underlying = is_underlying_config(tp_config)
+    compare_price = current_spot if is_underlying else current_price
+    if not compare_price:
+        return False, tp_price
+    direction = underlying_direction_is_sell(is_sell_position, option_type) if is_underlying else is_sell_position
+    hit = is_tp_hit(compare_price, tp_price, direction)
     return hit, tp_price
 
 
@@ -2797,6 +2828,11 @@ def process_tick(
             leg_id      = str(leg.get('id') or '')
             leg_cfg     = resolve_leg_cfg(leg_id, leg, all_leg_configs)
             entry_price = safe_float(entry_trade.get('price') or entry_trade.get('trigger_price'))
+            entry_spot  = safe_float(
+                entry_trade.get('spot_price')
+                or entry_trade.get('underlying_at_trade')
+                or entry_trade.get('underlying_trigger_price')
+            ) or None
             lot_size    = safe_int(leg.get('lot_size'), 1)
             lots        = safe_int(leg.get('quantity') or entry_trade.get('quantity'))
             qty         = max(0, lots) * max(1, lot_size)
@@ -2826,9 +2862,14 @@ def process_tick(
 
             pnl = ((entry_price - current_price) if sell_pos else (current_price - entry_price)) * qty
 
+            # ── Underlying spot (only fetched when a leg actually needs it) ─
+            current_spot = None
+            if is_underlying_config(leg_cfg.get('LegStopLoss') or {}) or is_underlying_config(leg_cfg.get('LegTarget') or {}):
+                current_spot = get_spot_at_time(ctx.db, underlying, ctx.now_ts, ctx.market_cache) or None
+
             # ── SL check ─────────────────────────────────────────────────
             stored_sl = safe_float(leg.get('current_sl_price') or leg.get('sl_price') or 0) or None
-            sl_hit, sl_price = check_leg_sl(leg_cfg, entry_price, current_price, stored_sl, sell_pos)
+            sl_hit, sl_price = check_leg_sl(leg_cfg, entry_price, current_price, stored_sl, sell_pos, entry_spot, current_spot, option_type)
             if sl_hit:
                 close_leg_in_db(ctx.db, trade_id, leg_index, current_price, 'stoploss', ctx.now_ts, leg_id=leg_id, exit_iv=_tick_iv, exit_vix=_tick_vix)
                 ctx.actions_taken.append(f'{trade_id}/{leg_id}: SL hit @ {current_price}')
@@ -2839,7 +2880,7 @@ def process_tick(
 
             # ── Target check ──────────────────────────────────────────────
             stored_tp = safe_float(leg.get('current_tp_price') or leg.get('tp_price') or 0) or None
-            tp_hit, tp_price = check_leg_target(leg_cfg, entry_price, current_price, stored_tp, sell_pos)
+            tp_hit, tp_price = check_leg_target(leg_cfg, entry_price, current_price, stored_tp, sell_pos, entry_spot, current_spot, option_type)
             if tp_hit:
                 close_leg_in_db(ctx.db, trade_id, leg_index, current_price, 'target', ctx.now_ts, leg_id=leg_id, exit_iv=_tick_iv, exit_vix=_tick_vix)
                 ctx.actions_taken.append(f'{trade_id}/{leg_id}: TP hit @ {current_price}')

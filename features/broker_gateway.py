@@ -20,8 +20,6 @@ import os
 import threading
 import time
 
-from features.debug_flags import debug_print
-
 # ── Active broker detection ───────────────────────────────────────────────────
 # Every process (algo.trade, algo.simulator, algo.scanner, algo.websocket) has
 # its own copy of this module-level cache. It used to be cached forever after
@@ -169,6 +167,9 @@ class _BrokerTickerProxy:
 
     @property
     def subscribed_tokens(self): return self._delegate.subscribed_tokens
+
+    @property
+    def chain_subscribed_tokens(self): return self._delegate.chain_subscribed_tokens
 
     @property
     def oi_map(self):
@@ -416,7 +417,14 @@ def get_broker_rest_quotes(
     _now_epoch = _time.time()
 
     # Determine new (un-subscribed) tokens before the loop so prints can be gated.
-    _subscribed = set(_dtm.subscribed_tokens or [])
+    # Union of the main connection's subscribed_tokens AND the chain-feed pool's
+    # chain_subscribed_tokens — option chain tokens live exclusively in the
+    # latter (see dhan_ticker.py's warm_chain_tokens), so checking only
+    # subscribed_tokens made every chain token look "never seen" even while it
+    # was actively ticking via the chain pool, forcing the expensive blocking
+    # dhan_quote_post_blocking()/wait_for_dhan_slot() path (~1s rate-gate wait)
+    # below instead of the fast skip-on-busy path a genuinely-warm token should get.
+    _subscribed = set(_dtm.subscribed_tokens or []) | set(_dtm.chain_subscribed_tokens or [])
     _not_subscribed = [t for t in token_ids if t not in _subscribed]
 
     # Populate from WS first — skip stale ticks older than 5 minutes
@@ -436,8 +444,6 @@ def get_broker_rest_quotes(
                     ltp = 0.0  # can't verify freshness → treat as stale
             else:
                 ltp = 0.0  # no timestamp → initial subscription price, treat as stale
-        if _not_subscribed:
-            debug_print(f'[REST_QUOTES_DEBUG] token={t} ws_ltp={raw_ltp} ws_ts={ts_str} tick_age={tick_age_sec} using_ws_ltp={ltp}')
         if ltp > 0 or oi > 0:
             result[t] = {"ltp": ltp, "oi": oi}
             if ltp > 0:
@@ -445,12 +451,6 @@ def get_broker_rest_quotes(
 
     # REST fallback for tokens missing LTP (BSE_FNO never gets WS ticks after hours)
     missing = [t for t in token_ids if t not in result or result[t]["ltp"] == 0]
-    if _not_subscribed:
-        debug_print(
-            f'[REST_QUOTES_DEBUG] missing_tokens={missing}  will_call_rest={bool(missing)}'
-            f'  |  requested={list(token_ids)}  subscribed_count={len(_subscribed)}'
-            f'  |  not_in_subscribed={_not_subscribed}'
-        )
 
     _segs = ws_segments or {}
 
@@ -467,8 +467,8 @@ def get_broker_rest_quotes(
                 new_by_segment.setdefault(_segs.get(t, "NSE_FNO").upper(), []).append(t)
             for segment, tokens in new_by_segment.items():
                 _dtm.subscribe_tokens(tokens, segment)
-        except Exception as exc:
-            debug_print(f'[REST_QUOTES_DEBUG] WS subscribe error: {exc}')
+        except Exception:
+            pass
 
     if not missing:
         return _fill_last_good(result)
@@ -502,8 +502,6 @@ def get_broker_rest_quotes(
         access_token = str(cfg.get("access_token") or "").strip()
         client_id    = str(cfg.get("user_id") or cfg.get("dhan_client_id") or "").strip()
         if not access_token:
-            if _not_subscribed:
-                debug_print(f'[REST_QUOTES_DEBUG] no access_token in db — REST skipped')
             return _fill_last_good(result)
 
         def _to_int(tok: str) -> int | None:
@@ -556,8 +554,6 @@ def get_broker_rest_quotes(
             if not req_body:
                 continue
 
-            if _not_subscribed:
-                debug_print(f'[REST_QUOTES_DEBUG] calling Dhan REST batch={_batch_idx} req_body={req_body}')
             resp = (
                 dhan_quote_post_blocking(req_body, access_token, client_id, timeout=10.0)
                 if _has_never_seen
@@ -570,11 +566,7 @@ def get_broker_rest_quotes(
                 # than spin through them for nothing — they, and this one,
                 # fall back to last-good below; a later refresh cycle picks
                 # up wherever this one left off.
-                if _not_subscribed:
-                    debug_print('[REST_QUOTES_DEBUG] skipped — global Dhan quote rate gate')
                 break
-            if _not_subscribed:
-                debug_print(f'[REST_QUOTES_DEBUG] REST status={resp.status_code} response={resp.text[:500]}')
 
             if resp.status_code == 200:
                 raw = resp.json()
@@ -623,13 +615,10 @@ def get_broker_rest_quotes(
                 # polling the same broker can burn that allowance. Don't let a
                 # rate-limited response wipe out tokens we've already priced —
                 # fall through to the _LAST_GOOD_QUOTE backfill below instead.
-                if _not_subscribed:
-                    debug_print(f'[REST_QUOTES_DEBUG] REST non-200 status={resp.status_code} — falling back to last-good cache')
+                pass
     except Exception as exc:
         import logging
         logging.getLogger(__name__).warning("[BROKER REST QUOTES] %s", exc)
-        if _not_subscribed:
-            debug_print(f'[REST_QUOTES_DEBUG] REST exception: {exc}')
         from features.telegram_notifier import notify_admin
         notify_admin('ltp_fetch_error', f'get_broker_rest_quotes Dhan REST call failed: {exc}')
 
@@ -642,8 +631,6 @@ def get_broker_rest_quotes(
             f'{len(still_unpriced)} token(s) have no LTP after REST fallback and no cached last-good price',
             {'tokens': ','.join(still_unpriced[:10])},
         )
-    if _not_subscribed:
-        debug_print(f'[REST_QUOTES_DEBUG] final_result={result}')
     return result
 
 

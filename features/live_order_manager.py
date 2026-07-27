@@ -911,7 +911,7 @@ def _recalc_sl_for_actual_fill(db, trade_id: str, leg_id: str, actual_fill: floa
     if actual_fill <= 0:
         return
     try:
-        from features.position_manager import calc_sl_price  # type: ignore
+        from features.position_manager import calc_sl_price, is_underlying_config  # type: ignore
         trade, leg, leg_cfg, hist_doc = _load_trade_and_leg_context(db, trade_id, leg_id)
         if not trade or not leg or not leg_cfg:
             return
@@ -919,6 +919,12 @@ def _recalc_sl_for_actual_fill(db, trade_id: str, leg_id: str, actual_fill: floa
         is_sell = _is_sell(position_str)
         sl_config = leg_cfg.get('LegStopLoss') or {}
         if not sl_config:
+            return
+        if is_underlying_config(sl_config):
+            # Underlying-based SL is a spot level fixed at entry — the option's
+            # actual fill price vs. its limit-order basis has no bearing on it,
+            # and there's no broker-native SL order to modify (see
+            # _place_initial_protection_orders). Nothing to recalc.
             return
         new_sl = _safe_float(calc_sl_price(actual_fill, is_sell, sl_config))
         if not new_sl:
@@ -1145,12 +1151,23 @@ def _place_initial_protection_orders(
     if str(trade.get('activation_mode') or '').strip() != 'live':
         return
 
-    from features.position_manager import calc_sl_price, calc_tp_price  # type: ignore
+    from features.position_manager import calc_sl_price, calc_tp_price, is_underlying_config  # type: ignore
 
     position_str = str(leg.get('position') or hist_doc.get('position') or '')
     is_sell = _is_sell(position_str)
     sl_config = leg_cfg.get('LegStopLoss') or {}
     tp_config = leg_cfg.get('LegTarget') or {}
+
+    # Underlying-based SL/TP (LegTgtSLType.UnderlyingPoints/UnderlyingPercentage)
+    # cannot be placed as a broker-native SL/target order — a broker order on the
+    # option can only watch that option's own LTP, never the index spot. Those
+    # legs are monitored purely in software (execution_socket per-tick checks).
+    if is_underlying_config(sl_config):
+        print(f'[SL CALC] trade={trade_id} leg={leg_id} skip=underlying_sl_no_broker_order')
+        sl_config = {}
+    if is_underlying_config(tp_config):
+        print(f'[SL CALC] trade={trade_id} leg={leg_id} skip=underlying_tp_no_broker_order')
+        tp_config = {}
 
     # fill_price = verified price from algo_trade_positions_history.entry_trade.price
     # Always calculate SL/TP from this price — never from algo_leg_feature_status.

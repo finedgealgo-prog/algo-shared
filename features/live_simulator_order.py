@@ -398,6 +398,11 @@ def record_entry_with_orders(
         entry_price = _safe_float(entry_trade.get('price') or entry_trade.get('trigger_price'))
         if not entry_price:
             return None
+        entry_spot = _safe_float(
+            entry_trade.get('spot_price')
+            or entry_trade.get('underlying_at_trade')
+            or entry_trade.get('underlying_trigger_price')
+        ) or None
 
         col = db._db[LIVE_SIM_ORDER_COLLECTION]
 
@@ -426,7 +431,7 @@ def record_entry_with_orders(
         sl_config = leg_cfg.get('LegStopLoss') or {}
         # Use stored SL price if already set, otherwise compute from config
         stored_sl = _safe_float(leg.get('current_sl_price') or leg.get('initial_sl_value')) or None
-        sl_price = stored_sl or (calc_sl_price(entry_price, is_sell_pos, sl_config) if sl_config else None)
+        sl_price = stored_sl or (calc_sl_price(entry_price, is_sell_pos, sl_config, entry_spot, fields['option_type']) if sl_config else None)
         if sl_price:
             sl_order_id = _build_order_id(trade_id, leg_id, 'sl')
             sl_doc = _build_sl_doc(
@@ -438,7 +443,7 @@ def record_entry_with_orders(
 
         # ── Target order ──────────────────────────────────────────────────────
         tp_config = leg_cfg.get('LegTarget') or {}
-        tp_price = calc_tp_price(entry_price, is_sell_pos, tp_config) if tp_config else None
+        tp_price = calc_tp_price(entry_price, is_sell_pos, tp_config, entry_spot, fields['option_type']) if tp_config else None
         if tp_price:
             tp_order_id = _build_order_id(trade_id, leg_id, 'target')
             tp_doc = _build_target_doc(

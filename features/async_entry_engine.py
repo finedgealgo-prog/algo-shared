@@ -893,7 +893,7 @@ async def _async_process_momentum_pending_feature_legs_ff(
         leg_cfg = all_leg_configs.get(lazy_leg_ref) or all_leg_configs.get(leg_id) or {}
         entry_price = current_price if (is_instant_entry or not target_price or _is_market_order(leg_cfg, 'entry')) else target_price
         sl_config = leg_cfg.get('LegStopLoss') or {}
-        sl_price = calc_sl_price(entry_price, is_sell_pos, sl_config)
+        sl_price = calc_sl_price(entry_price, is_sell_pos, sl_config, spot_price, option_type)
         actual_quantity = lot_config_value
 
         lazy_entry_vix: float | None = None

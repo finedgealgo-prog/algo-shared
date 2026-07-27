@@ -287,8 +287,16 @@ async def _ws_authenticate(websocket: WebSocket, *, timeout: float = 10.0) -> st
     """
     try:
         raw = await asyncio.wait_for(websocket.receive_text(), timeout=timeout)
-    except (asyncio.TimeoutError, WebSocketDisconnect):
+    except asyncio.TimeoutError:
         await websocket.close(code=4401, reason='Authentication timed out')
+        return None
+    except WebSocketDisconnect:
+        # Client already disconnected (e.g. React StrictMode's dev-mode
+        # double-mount closing the first of two sockets before it ever sends
+        # the auth frame) — the connection is already gone server-side too,
+        # so calling close() again raises (starlette/uvicorn treat a second
+        # websocket.close after the disconnect as an ASGI protocol error:
+        # "Unexpected ASGI message ... after sending 'websocket.close'").
         return None
     try:
         parsed = json.loads(raw)
@@ -1498,6 +1506,8 @@ from features.position_manager import (
     calc_tp_price,
     is_sl_hit,
     is_tp_hit,
+    is_underlying_config,
+    underlying_direction_is_sell,
     update_trail_sl,
     get_trail_config,
     get_reentry_sl_config,
@@ -1783,6 +1793,49 @@ def _mark_trade_squared_off_at_exit_time(db: MongoData, trade_id: str) -> None:
         log.error('_mark_trade_squared_off_at_exit_time error trade=%s: %s', normalized_trade_id, exc)
         log_db_error('algo_trades', 'squared_off_exit_time', exc, normalized_trade_id)
     mark_execute_order_dirty_from_trade_id(db, normalized_trade_id)
+
+
+EXIT_TIME_SQUAREOFF_LOCK_FIELD = 'exit_time_squareoff_lock_at'
+EXIT_TIME_SQUAREOFF_LOCK_TTL_SECONDS = 5
+
+
+def acquire_exit_time_squareoff_lock(db: MongoData, trade_id: str, now_ts: str) -> bool:
+    """
+    Atomic short-TTL lock so a trade's scheduled exit_time force-exit can
+    only be acted on by ONE caller at a time. Two independent paths both
+    evaluate "exit_time has passed" for the same trade: the tick-driven
+    force-exit in _process_backtest_trade_tick (runs on every broker tick,
+    live/fast-forward/forward-test included despite the function's name) and
+    LiveExitMonitor's per-second safety-net check. Without this, both could
+    both see a still-open leg and each place a broker exit order for it in
+    the same race window on a real live position.
+
+    Deliberately a short TTL, not a one-time claim: the tick-driven path
+    already relies on retrying on the next tick if an earlier attempt only
+    partially closed a trade (e.g. one leg's exit order failed), and a
+    permanent claim would break that retry. 5s is long enough to cover one
+    attempt's DB writes / broker calls, short enough that a genuinely stuck
+    trade isn't locked out for more than a few seconds.
+    """
+    normalized_trade_id = str(trade_id or '').strip()
+    if not normalized_trade_id:
+        return False
+    try:
+        cutoff_dt = datetime.strptime(now_ts, '%Y-%m-%dT%H:%M:%S') - timedelta(seconds=EXIT_TIME_SQUAREOFF_LOCK_TTL_SECONDS)
+        cutoff = cutoff_dt.strftime('%Y-%m-%dT%H:%M:%S')
+    except ValueError:
+        cutoff = ''
+    result = db._db['algo_trades'].update_one(
+        {
+            '_id': normalized_trade_id,
+            '$or': [
+                {EXIT_TIME_SQUAREOFF_LOCK_FIELD: {'$exists': False}},
+                {EXIT_TIME_SQUAREOFF_LOCK_FIELD: {'$lt': cutoff}},
+            ],
+        },
+        {'$set': {EXIT_TIME_SQUAREOFF_LOCK_FIELD: now_ts}},
+    )
+    return result.modified_count > 0
 
 
 def _square_off_trade_like_manual(
@@ -4130,7 +4183,7 @@ def _process_momentum_pending_feature_legs(
                         else target_price
                     )
                     sl_config = leg_cfg.get('LegStopLoss') or {}
-                    sl_price = calc_sl_price(entry_price, is_sell_pos, sl_config)
+                    sl_price = calc_sl_price(entry_price, is_sell_pos, sl_config, spot_price, option_type)
                     lazy_entry_vix: float | None = None
                     try:
                         from features.trading_core import get_vix_at_time as _get_vix  # type: ignore
@@ -4177,7 +4230,7 @@ def _process_momentum_pending_feature_legs(
                 leg_cfg = all_leg_configs.get(lazy_leg_ref) or all_leg_configs.get(leg_id) or {}
                 is_sell_pos = _is_sell(position_str)
                 sl_config = leg_cfg.get('LegStopLoss') or {}
-                sl_price = calc_sl_price(target_price, is_sell_pos, sl_config)
+                sl_price = calc_sl_price(target_price, is_sell_pos, sl_config, spot_price, option_type)
                 _retry_vix: float | None = None
                 try:
                     from features.trading_core import get_vix_at_time as _get_vix
@@ -4232,7 +4285,7 @@ def _process_momentum_pending_feature_legs(
             else target_price
         )
         sl_config = leg_cfg.get('LegStopLoss') or {}
-        sl_price = calc_sl_price(entry_price, is_sell_pos, sl_config)
+        sl_price = calc_sl_price(entry_price, is_sell_pos, sl_config, spot_price, option_type)
         actual_quantity = lot_config_value
 
         _lazy_entry_vix: float | None = None
@@ -4694,13 +4747,20 @@ def trigger_live_exit_followups(
                 trigger_leg_feature, disable_leg_features,
             )
             from features.position_manager import calc_sl_price, calc_tp_price  # type: ignore
-            _entry_price = _safe_float((live_leg.get('entry_trade') or {}).get('price') or live_leg.get('entry_price'))
+            _entry_trade = live_leg.get('entry_trade') or {}
+            _entry_price = _safe_float(_entry_trade.get('price') or live_leg.get('entry_price'))
+            _entry_spot  = _safe_float(
+                _entry_trade.get('spot_price')
+                or _entry_trade.get('underlying_at_trade')
+                or _entry_trade.get('underlying_trigger_price')
+            ) or None
             _is_sell = _is_sell(str(live_leg.get('position') or ''))
+            _option_type = str(live_leg.get('option') or '')
             if normalized_reason == 'stoploss':
                 _sl_cfg = (leg_cfg or {}).get('LegStopLoss') or {}
                 sl_price = _safe_float(live_leg.get('current_sl_price') or live_leg.get('initial_sl_value'))
                 if not sl_price and _entry_price and _sl_cfg:
-                    sl_price = _safe_float(calc_sl_price(_entry_price, _is_sell, _sl_cfg))
+                    sl_price = _safe_float(calc_sl_price(_entry_price, _is_sell, _sl_cfg, _entry_spot, _option_type))
                 record_sl_hit(db._db, trade, live_leg, now_ts, fill_price, sl_price or 0.0)
                 trigger_leg_feature(db._db, normalized_trade_id, normalized_leg_id, 'sl', fill_price, now_ts)
                 disable_leg_features(db._db, normalized_trade_id, normalized_leg_id, except_feature='sl', reason='sl_triggered', timestamp=now_ts)
@@ -4708,7 +4768,7 @@ def trigger_live_exit_followups(
                 _tp_cfg = (leg_cfg or {}).get('LegTarget') or {}
                 tp_price = 0.0
                 if _entry_price and _tp_cfg:
-                    tp_price = _safe_float(calc_tp_price(_entry_price, _is_sell, _tp_cfg))
+                    tp_price = _safe_float(calc_tp_price(_entry_price, _is_sell, _tp_cfg, _entry_spot, _option_type))
                 record_target_hit(db._db, trade, live_leg, now_ts, fill_price, tp_price or 0.0)
                 trigger_leg_feature(db._db, normalized_trade_id, normalized_leg_id, 'target', fill_price, now_ts)
                 disable_leg_features(db._db, normalized_trade_id, normalized_leg_id, except_feature='target', reason='target_triggered', timestamp=now_ts)
@@ -5304,7 +5364,7 @@ def _try_enter_pending_leg(db: MongoData, trade: dict, leg: dict,
     all_leg_configs = _resolve_trade_leg_configs(trade)
     leg_cfg = _resolve_leg_cfg(leg_id_str, leg, all_leg_configs)
     sl_config = leg_cfg.get('LegStopLoss') or {}
-    sl_price = calc_sl_price(entry_price, is_sell_pos, sl_config)
+    sl_price = calc_sl_price(entry_price, is_sell_pos, sl_config, spot_price, option_type)
 
     # quantity = LotConfig.Value directly (not multiplied by lot_size)
     lot_config_value = max(1, int(
@@ -5635,8 +5695,9 @@ def apply_resolved_live_entries(
         spot_price = _safe_float(info.get('spot_price'))
         position_str = str(leg_cfg.get('PositionType') or 'PositionType.Sell')
         is_sell_pos = _is_sell(position_str)
+        option_type = str(leg_cfg.get('InstrumentKind') or '').split('.')[-1] or 'CE'
         sl_config = leg_cfg.get('LegStopLoss') or {}
-        sl_price = calc_sl_price(entry_price, is_sell_pos, sl_config)
+        sl_price = calc_sl_price(entry_price, is_sell_pos, sl_config, spot_price, option_type)
 
         lot_config_value = max(1, int(
             (leg_cfg.get('LotConfig') or {}).get('Value')
@@ -9076,6 +9137,11 @@ def _extract_running_positions(
                 continue
 
             entry_price = _safe_float(entry_trade.get('price'))
+            entry_spot  = _safe_float(
+                entry_trade.get('spot_price')
+                or entry_trade.get('underlying_at_trade')
+                or entry_trade.get('underlying_trigger_price')
+            ) or None
             quantity = _safe_int(leg.get('quantity') or entry_trade.get('quantity'))
             lot_size = _safe_int(leg.get('lot_size'), 1)
             effective_quantity = max(0, quantity) * max(1, lot_size)
@@ -9127,8 +9193,8 @@ def _extract_running_positions(
                 'lot_size': lot_size,
                 'pnl': round(pnl, 2),
                 'entry_timestamp': entry_timestamp,
-                'sl_price': calc_sl_price(entry_price, is_sell_pos, leg_cfg.get('LegStopLoss') or {}),
-                'tp_price': calc_tp_price(entry_price, is_sell_pos, leg_cfg.get('LegTarget') or {}),
+                'sl_price': calc_sl_price(entry_price, is_sell_pos, leg_cfg.get('LegStopLoss') or {}, entry_spot, option_type),
+                'tp_price': calc_tp_price(entry_price, is_sell_pos, leg_cfg.get('LegTarget') or {}, entry_spot, option_type),
                 'snapshot': {
                     'timestamp': chain_doc.get('timestamp') or snapshot_timestamp,
                     'underlying': chain_doc.get('underlying') or underlying,
@@ -9254,6 +9320,13 @@ def _process_backtest_trade_tick(
         trigger_leg_feature, disable_leg_features, rotate_trail_sl_record,
     )
 
+    # Claimed once per trade per tick (not per leg) — see
+    # acquire_exit_time_squareoff_lock's docstring for why this exists: the
+    # per-second LiveExitMonitor safety net checks the same "exit_time
+    # passed" condition independently, and without this both could act on
+    # the same live position in the same race window.
+    _exit_lock_acquired = acquire_exit_time_squareoff_lock(db, trade_id, now_ts) if past_exit else False
+
     # ── Per-leg event checks ───────────────────────────────────────────────────
     for leg_index, leg in enumerate(legs):
         leg_status = int(leg.get('status') or 0)
@@ -9276,7 +9349,7 @@ def _process_backtest_trade_tick(
         is_sell_pos  = _is_sell(position_str)
 
         # ── Force-exit at exit_time ────────────────────────────────────────
-        if past_exit:
+        if past_exit and _exit_lock_acquired:
             _exit_strike_int = int(float(str(strike or 0))) if strike is not None else 0
             _expiry_date_10  = expiry_date[:10]
             _opt_upper       = option_type.upper()
@@ -9381,22 +9454,43 @@ def _process_backtest_trade_tick(
         tp_config    = leg_cfg.get('LegTarget') or {}
         trail_config = get_trail_config(leg_cfg)
 
-        initial_sl  = _safe_float(leg.get('initial_sl_value')) or calc_sl_price(entry_price, is_sell_pos, sl_config)
+        # Underlying-based SL/TP (LegTgtSLType.UnderlyingPoints/UnderlyingPercentage)
+        # trigger off index spot, not the option premium — resolve entry_spot from
+        # the entry snapshot and fetch current spot only when actually needed.
+        entry_spot = _safe_float(
+            entry_trade.get('spot_price')
+            or entry_trade.get('underlying_at_trade')
+            or entry_trade.get('underlying_trigger_price')
+        ) or None
+        current_spot = None
+        if is_underlying_config(sl_config) or is_underlying_config(tp_config):
+            current_spot = get_spot_at_time(db, underlying, now_ts, market_cache) or None
+
+        initial_sl  = _safe_float(leg.get('initial_sl_value')) or calc_sl_price(entry_price, is_sell_pos, sl_config, entry_spot, option_type)
         stored_sl   = _safe_float(leg.get('current_sl_price')) or None
         sl_price    = stored_sl or initial_sl
         if sl_price and trail_config:
             sl_price = update_trail_sl(entry_price, current_price, sl_price, is_sell_pos, trail_config, initial_sl=initial_sl)
 
-        tp_price = calc_tp_price(entry_price, is_sell_pos, tp_config)
+        tp_price = calc_tp_price(entry_price, is_sell_pos, tp_config, entry_spot, option_type)
         pnl      = (
             (entry_price - current_price) * effective_quantity
             if is_sell_pos else
             (current_price - entry_price) * effective_quantity
         )
 
+        sl_is_underlying = is_underlying_config(sl_config)
+        tp_is_underlying = is_underlying_config(tp_config)
+        sl_compare_price = current_spot if sl_is_underlying else current_price
+        tp_compare_price = current_spot if tp_is_underlying else current_price
+        sl_direction = underlying_direction_is_sell(is_sell_pos, option_type) if sl_is_underlying else is_sell_pos
+        tp_direction = underlying_direction_is_sell(is_sell_pos, option_type) if tp_is_underlying else is_sell_pos
+
         # ── SL hit ────────────────────────────────────────────────────────
-        if is_sl_hit(current_price, sl_price, is_sell_pos):
-            _sl_exit_price = current_price if _is_market_order(leg_cfg, 'exit') else sl_price
+        if sl_compare_price and is_sl_hit(sl_compare_price, sl_price, sl_direction):
+            # sl_price is a spot level for underlying-based SL — not a valid
+            # option limit price, so always exit at the option's current_price.
+            _sl_exit_price = current_price if (is_underlying_config(sl_config) or _is_market_order(leg_cfg, 'exit')) else sl_price
             close_leg_in_db(db, trade_id, leg_index, _sl_exit_price, 'stoploss', now_ts, leg_id=leg_id, activation_mode=activation_mode, exit_iv=_bt_sl_tp_iv, exit_vix=_bt_sl_tp_vix)
             actions_taken.append(f'{trade_id}/{leg_id}: SL hit @ {_sl_exit_price}')
             record_sl_hit(db._db, trade, leg, now_ts, _sl_exit_price, sl_price or 0.0)
@@ -9446,8 +9540,10 @@ def _process_backtest_trade_tick(
             continue
 
         # ── TP hit ────────────────────────────────────────────────────────
-        if is_tp_hit(current_price, tp_price, is_sell_pos):
-            _tp_exit_price = current_price if _is_market_order(leg_cfg, 'exit') else tp_price
+        if tp_compare_price and is_tp_hit(tp_compare_price, tp_price, tp_direction):
+            # tp_price is a spot level for underlying-based TP — not a valid
+            # option limit price, so always exit at the option's current_price.
+            _tp_exit_price = current_price if (is_underlying_config(tp_config) or _is_market_order(leg_cfg, 'exit')) else tp_price
             close_leg_in_db(db, trade_id, leg_index, _tp_exit_price, 'target', now_ts, leg_id=leg_id, activation_mode=activation_mode, exit_iv=_bt_sl_tp_iv, exit_vix=_bt_sl_tp_vix)
             actions_taken.append(f'{trade_id}/{leg_id}: TP hit @ {_tp_exit_price}')
             record_target_hit(db._db, trade, leg, now_ts, _tp_exit_price, tp_price or 0.0)
@@ -11032,8 +11128,17 @@ def _live_minute_tick(db: MongoData, trade_date: str) -> dict:
             tp_config = leg_cfg.get('LegTarget') or {}
             trail_config = sl_config.get('Trail') or {}
 
+            # Underlying-based SL/TP trigger off index spot, not the option
+            # premium — spot_price above already comes from this tick's chain_doc.
+            entry_spot = _safe_float(
+                entry_trade.get('spot_price')
+                or entry_trade.get('underlying_at_trade')
+                or entry_trade.get('underlying_trigger_price')
+            ) or None
+            current_spot = spot_price or None
+
             # Compute / update SL price
-            initial_sl = _safe_float(leg.get('initial_sl_value')) or calc_sl_price(entry_price, is_sell_pos, sl_config)
+            initial_sl = _safe_float(leg.get('initial_sl_value')) or calc_sl_price(entry_price, is_sell_pos, sl_config, entry_spot, option_type)
             stored_sl = _safe_float(leg.get('current_sl_price')) or None
             sl_price = stored_sl or initial_sl
             if sl_price and trail_config:
@@ -11046,7 +11151,7 @@ def _live_minute_tick(db: MongoData, trade_date: str) -> dict:
                     initial_sl=initial_sl,
                 )
 
-            tp_price = calc_tp_price(entry_price, is_sell_pos, tp_config)
+            tp_price = calc_tp_price(entry_price, is_sell_pos, tp_config, entry_spot, option_type)
             pnl = (
                 (entry_price - current_price) * effective_quantity
                 if is_sell_pos else
@@ -11061,9 +11166,16 @@ def _live_minute_tick(db: MongoData, trade_date: str) -> dict:
                 trigger_leg_feature, disable_leg_features, rotate_trail_sl_record,
             )
 
+            sl_is_underlying = is_underlying_config(sl_config)
+            tp_is_underlying = is_underlying_config(tp_config)
+            sl_compare_price = current_spot if sl_is_underlying else current_price
+            tp_compare_price = current_spot if tp_is_underlying else current_price
+            sl_direction = underlying_direction_is_sell(is_sell_pos, option_type) if sl_is_underlying else is_sell_pos
+            tp_direction = underlying_direction_is_sell(is_sell_pos, option_type) if tp_is_underlying else is_sell_pos
+
             # ── SL hit ────────────────────────────────────────────────────
-            if is_sl_hit(current_price, sl_price, is_sell_pos):
-                _sl_exit_price = current_price if _is_market_order(leg_cfg, 'exit') else sl_price
+            if sl_compare_price and is_sl_hit(sl_compare_price, sl_price, sl_direction):
+                _sl_exit_price = current_price if (is_underlying_config(sl_config) or _is_market_order(leg_cfg, 'exit')) else sl_price
                 try:
                     from features.live_order_manager import has_open_exit_order as _has_sl_order
                     if _has_sl_order(db, trade_id, leg_id, 'stoploss'):
@@ -11117,8 +11229,8 @@ def _live_minute_tick(db: MongoData, trade_date: str) -> dict:
                 continue  # leg is now closed
 
             # ── TP hit ────────────────────────────────────────────────────
-            if is_tp_hit(current_price, tp_price, is_sell_pos):
-                _tp_exit_price = current_price if _is_market_order(leg_cfg, 'exit') else tp_price
+            if tp_compare_price and is_tp_hit(tp_compare_price, tp_price, tp_direction):
+                _tp_exit_price = current_price if (is_underlying_config(tp_config) or _is_market_order(leg_cfg, 'exit')) else tp_price
                 try:
                     from features.live_order_manager import has_open_exit_order as _has_tp_order
                     if _has_tp_order(db, trade_id, leg_id, 'target'):

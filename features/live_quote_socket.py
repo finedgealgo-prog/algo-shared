@@ -28,10 +28,29 @@ from typing import Any
 
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 
+from features.instrument_ref_manager import acquire as _ref_acquire, release as _ref_release
+
 log = logging.getLogger(__name__)
 IST = timezone(timedelta(hours=5, minutes=30))
 EMIT_INTERVAL_SECONDS = 0.5
 REST_REFRESH_INTERVAL_SECONDS = 1.5
+# How often each session re-heartbeats its subscribed tokens in
+# instrument_ref_manager — well under the ref TTL (45s), but far less
+# frequent than the 0.5s emit loop so this doesn't multiply Redis load by
+# the connected-session count on every tick.
+REF_HEARTBEAT_INTERVAL_SECONDS = 15.0
+# Demand-side admission control for chart-driven token subscriptions. This is
+# deliberately NOT enforced by evicting/reconnecting anything on the broker
+# side (dhan_ticker.py's main connection is shared with live order execution
+# ticks — see its module docstring — so an automatic reconnect-to-trim there
+# would risk interrupting live SL/TP; the chain-feed pool is a separate,
+# admin/strategy-driven whole-chain prewarm mechanism, not what per-session
+# chart subscribes ride on). Instead, new chart-only token requests are
+# simply refused once the broker connection is already near its own cap
+# (mirrors dhan_ticker.py's DHAN_MAX_TOKENS=5000, headroom=500 warning
+# threshold — refusing new chart demand right where that warning starts,
+# well before live positions could ever be affected).
+CHART_TOKEN_ADMISSION_CAP = 4500
 # Paid-plan-only MTM broadcast (see "auth" action / _handle_auth) — a session's
 # strategy list + mode is a one-time-ish Mongo read, not a per-tick one, so this
 # just governs how stale that cache is allowed to get before re-reading it.
@@ -106,6 +125,18 @@ class _LiveQuoteSession:
     last_sent_mtm: dict[str, float] = field(default_factory=dict)   # strategy_id -> last emitted total MTM
     last_strategy_refresh: float = 0.0
     last_normal_batch: float = 0.0
+    # See instrument_ref_manager — refreshed periodically in _emit_loop so a
+    # long-lived session's tokens don't age out of the ref TTL, without
+    # hammering Redis on every 0.5s tick.
+    last_ref_heartbeat: float = 0.0
+    # ── Chart "attach to whatever instrument is currently active" (attach_instrument /
+    # detach_instrument actions) — one active chart symbol per session. Index/stock
+    # underlyings have no per-token subscription (they ride the existing
+    # underlying_update broadcast, see _refresh_underlying_quotes' "UL:" ref keys
+    # below); option/future symbols resolve to a real token and reuse the same
+    # subscribed_tokens/admission-control path as the "resolve" action. ──
+    attached_underlying: str | None = None
+    attached_token: str | None = None
 
 
 class _LiveQuoteHub:
@@ -149,6 +180,10 @@ class _LiveQuoteHub:
 
     async def unregister(self, session: _LiveQuoteSession) -> None:
         session.closed = True
+        for token in session.subscribed_tokens:
+            _ref_release(token, "chart", session.session_id)
+        if session.attached_underlying:
+            _ref_release(f"UL:{session.attached_underlying}", "chart", session.session_id)
         if session.task and not session.task.done():
             session.task.cancel()
             try:
@@ -159,6 +194,25 @@ class _LiveQuoteHub:
                 log.debug("live quote task close error session=%s: %s", session.session_id, exc)
         async with self._lock:
             self._sessions.pop(session.session_id, None)
+
+    def _admit_new_tokens(self, new_tokens: list[str]) -> tuple[list[str], list[str]]:
+        """Demand-side admission control — see CHART_TOKEN_ADMISSION_CAP. Never
+        touches an already-subscribed token; only decides whether to let NEW
+        chart-driven tokens through to _ensure_broker_subscribed. Returns
+        (admitted, rejected)."""
+        if not new_tokens:
+            return [], []
+        try:
+            from features.broker_gateway import broker_ticker_manager
+            current_count = len(broker_ticker_manager.subscribed_tokens or set())
+        except Exception:
+            return new_tokens, []  # fail-open: broker state unreadable, don't block chart usage over it
+        room = CHART_TOKEN_ADMISSION_CAP - current_count
+        if room <= 0:
+            return [], new_tokens
+        if len(new_tokens) <= room:
+            return new_tokens, []
+        return new_tokens[:room], new_tokens[room:]
 
     async def handle_client_message(self, session: _LiveQuoteSession, raw_message: str) -> None:
         try:
@@ -176,25 +230,46 @@ class _LiveQuoteHub:
             await self._handle_auth(session, payload)
             return
 
+        if action == "attach_instrument":
+            await self._handle_attach_instrument(session, payload)
+            return
+
+        if action == "detach_instrument":
+            await self._detach_current(session)
+            return
+
         if action == "unsubscribe":
             for token in tokens:
                 session.subscribed_tokens.discard(token)
                 session.last_sent.pop(token, None)
+                _ref_release(token, "chart", session.session_id)
             return
 
         if action == "subscribe":
-            new_tokens = [t for t in tokens if t not in session.subscribed_tokens]
-            session.subscribed_tokens.update(tokens)
+            candidate_tokens = [t for t in tokens if t not in session.subscribed_tokens]
+            new_tokens, rejected_tokens = self._admit_new_tokens(candidate_tokens)
+            session.subscribed_tokens.update(new_tokens)
         elif action == "replace":
             # The basket's leg set changes as a whole on every add/remove/expiry-change, so the
             # client just resends its current full token list rather than diffing client-side.
-            new_tokens = [t for t in tokens if t not in session.subscribed_tokens]
+            candidate_tokens = [t for t in tokens if t not in session.subscribed_tokens]
+            new_tokens, rejected_tokens = self._admit_new_tokens(candidate_tokens)
             removed_tokens = session.subscribed_tokens - set(tokens)
-            session.subscribed_tokens = set(tokens)
+            session.subscribed_tokens = (session.subscribed_tokens - removed_tokens) | set(new_tokens)
             for token in removed_tokens:
                 session.last_sent.pop(token, None)
+                _ref_release(token, "chart", session.session_id)
         else:
             return
+
+        if rejected_tokens:
+            await self._send_message(session, "subscribe_rejected", {
+                "tokens": rejected_tokens,
+                "message": "live-quote token capacity reached; try again shortly",
+            })
+
+        for token in session.subscribed_tokens:
+            _ref_acquire(token, "chart", session.session_id)
 
         if new_tokens:
             await asyncio.to_thread(self._ensure_broker_subscribed, new_tokens)
@@ -243,7 +318,20 @@ class _LiveQuoteHub:
             return
 
         token = contract["token"]
+        if token not in session.subscribed_tokens:
+            admitted, rejected = self._admit_new_tokens([token])
+            if rejected:
+                await self._send_message(session, "resolve_error", {
+                    "request_id": request_id,
+                    "instrument": instrument,
+                    "expiry": expiry,
+                    "strike": strike,
+                    "option_type": option_type,
+                    "message": "live-quote token capacity reached; try again shortly",
+                })
+                return
         session.subscribed_tokens.add(token)
+        _ref_acquire(token, "chart", session.session_id)
         await asyncio.to_thread(self._ensure_broker_subscribed, [token])
 
         from features.broker_gateway import broker_ticker_manager
@@ -259,6 +347,137 @@ class _LiveQuoteHub:
             "symbol": contract.get("symbol") or "",
             "ltp": float(ltp) if ltp else None,
         })
+
+    async def _handle_attach_instrument(self, session: _LiveQuoteSession, payload: dict) -> None:
+        """
+        "This session's chart is now looking at symbol X" — one active chart
+        symbol per session, replacing whatever was attached before (see
+        _detach_current). Index/stock underlyings have no per-token broker
+        subscription of their own; they ride the existing always-on
+        underlying_update broadcast (_refresh_underlying_quotes), which this
+        just adds a "UL:{instrument}" ref-manager key to so that broadcast's
+        instrument set also covers whatever chart symbols are currently
+        actually being viewed, not only strategy-linked ones. Option/future
+        symbols resolve to a real token and reuse the same subscribed_tokens
+        + admission-control path _handle_resolve already uses.
+        """
+        symbol = payload.get("symbol") or {}
+        kind = str(symbol.get("kind") or "").strip().lower()
+        instrument = str(symbol.get("instrument") or "").strip().upper()
+        if not instrument or kind not in ("index", "stock", "commodity", "option", "future"):
+            await self._send_message(session, "attach_error", {
+                "message": "symbol.kind and symbol.instrument are required",
+            })
+            return
+
+        await self._detach_current(session)
+
+        if kind in ("index", "stock", "commodity"):
+            session.attached_underlying = instrument
+            _ref_acquire(f"UL:{instrument}", "chart", session.session_id)
+            await self._send_message(session, "attached", {"instrument": instrument, "kind": kind})
+            return
+
+        if kind == "future":
+            # Nearest expiry, resolved server-side — the frontend's symbol
+            # search only ever hands back the bare instrument for a future
+            # (same "pick the underlying, resolve the actual contract later"
+            # shape as chart_data.py's historical-bars path for symbol_type=
+            # future), so this doesn't wait on the caller to supply expiry.
+            contract = await asyncio.to_thread(self._lookup_nearest_future, instrument)
+            if not contract:
+                await self._send_message(session, "attach_error", {
+                    "instrument": instrument,
+                    "message": "no future contract found",
+                })
+                return
+            await self._attach_resolved_token(session, instrument, kind, contract, {
+                "expiry": contract.get("expiry") or "",
+                "strike": 0.0,
+                "option_type": "FUT",
+            })
+            return
+
+        # option — same contract shape as the "resolve" action.
+        expiry = str(symbol.get("expiry") or "").strip()[:10]
+        option_type = str(symbol.get("option_type") or "").strip().upper()
+        try:
+            strike = float(symbol.get("strike"))
+        except (TypeError, ValueError):
+            strike = None
+
+        if not expiry or option_type not in ("CE", "PE") or strike is None:
+            await self._send_message(session, "attach_error", {
+                "instrument": instrument,
+                "message": "expiry, strike and option_type are required for an option",
+            })
+            return
+
+        contract = await asyncio.to_thread(self._lookup_contract, instrument, expiry, strike, option_type)
+        if not contract:
+            await self._send_message(session, "attach_error", {
+                "instrument": instrument,
+                "expiry": expiry,
+                "strike": strike,
+                "option_type": option_type,
+                "message": "contract not found",
+            })
+            return
+        await self._attach_resolved_token(session, instrument, kind, contract, {
+            "expiry": expiry,
+            "strike": strike,
+            "option_type": option_type,
+        })
+
+    async def _attach_resolved_token(
+        self,
+        session: _LiveQuoteSession,
+        instrument: str,
+        kind: str,
+        contract: dict,
+        contract_meta: dict,
+    ) -> None:
+        """Shared tail for both the future and option attach paths — admission
+        control, subscribe, ack. contract is {"token": ..., "symbol": ...} as
+        returned by _lookup_contract / _lookup_nearest_future."""
+        token = contract["token"]
+        admitted, rejected = self._admit_new_tokens([token])
+        if rejected:
+            await self._send_message(session, "attach_error", {
+                "instrument": instrument,
+                "message": "live-quote token capacity reached; try again shortly",
+            })
+            return
+
+        session.subscribed_tokens.add(token)
+        session.attached_token = token
+        _ref_acquire(token, "chart", session.session_id)
+        await asyncio.to_thread(self._ensure_broker_subscribed, [token])
+
+        from features.broker_gateway import broker_ticker_manager
+        ltp = broker_ticker_manager.get_ltp(token)
+        await self._send_message(session, "attached", {
+            "instrument": instrument,
+            "kind": kind,
+            "token": token,
+            "symbol": contract.get("symbol") or "",
+            "ltp": float(ltp) if ltp else None,
+            **contract_meta,
+        })
+
+    async def _detach_current(self, session: _LiveQuoteSession) -> None:
+        """Release whatever attach_instrument last attached for this session — called
+        on every new attach (one active chart symbol per session), on an explicit
+        detach_instrument message, and on disconnect (see unregister)."""
+        if session.attached_underlying:
+            _ref_release(f"UL:{session.attached_underlying}", "chart", session.session_id)
+            session.attached_underlying = None
+        if session.attached_token:
+            token = session.attached_token
+            session.subscribed_tokens.discard(token)
+            session.last_sent.pop(token, None)
+            _ref_release(token, "chart", session.session_id)
+            session.attached_token = None
 
     async def _handle_auth(self, session: _LiveQuoteSession, payload: dict) -> None:
         """
@@ -395,6 +614,39 @@ class _LiveQuoteHub:
             return None
         return {"token": token, "symbol": str(doc.get("symbol") or "")}
 
+    def _lookup_nearest_future(self, instrument: str) -> dict | None:
+        """Same nearest-expiry resolution as chart_data.py's
+        _resolve_nearest_future_contract (kept as a separate local query
+        rather than a cross-module import — _lookup_contract right above
+        already duplicates this same active_option_tokens lookup shape
+        locally instead of reaching into another feature module for it)."""
+        from features.mongo_data import MongoData
+        today = datetime.now(IST).strftime("%Y-%m-%d")
+        db = MongoData()
+        try:
+            doc = db._db["active_option_tokens"].find_one(
+                {
+                    "instrument": instrument,
+                    "option_type": "FUT",
+                    "broker": "dhan",
+                    "expiry": {"$gte": today},
+                },
+                {"_id": 0, "token": 1, "tokens": 1, "symbol": 1, "expiry": 1},
+                sort=[("expiry", 1)],
+            )
+        finally:
+            db.close()
+        if not doc:
+            return None
+        token = str(doc.get("token") or doc.get("tokens") or "").strip()
+        if not token:
+            return None
+        return {
+            "token": token,
+            "symbol": str(doc.get("symbol") or ""),
+            "expiry": str(doc.get("expiry") or "")[:10],
+        }
+
     def _ensure_broker_subscribed(self, tokens: list[str]) -> None:
         try:
             from features.live_event import _subscribe_live_option_token
@@ -410,6 +662,14 @@ class _LiveQuoteHub:
     async def _emit_loop(self, session: _LiveQuoteSession) -> None:
         try:
             while not session.closed:
+                if session.subscribed_tokens or session.attached_underlying:
+                    now_monotonic = time.monotonic()
+                    if now_monotonic - session.last_ref_heartbeat >= REF_HEARTBEAT_INTERVAL_SECONDS:
+                        session.last_ref_heartbeat = now_monotonic
+                        for token in session.subscribed_tokens:
+                            _ref_acquire(token, "chart", session.session_id)
+                        if session.attached_underlying:
+                            _ref_acquire(f"UL:{session.attached_underlying}", "chart", session.session_id)
                 if session.subscribed_tokens:
                     changed = self._collect_changed_ltp(session)
                     if changed:
@@ -496,18 +756,41 @@ class _LiveQuoteHub:
 
     def _collect_changed_underlyings(self, session: _LiveQuoteSession) -> list[dict]:
         """Pure dict lookup, no I/O — same shape as _collect_changed_ltp, just
-        reading the hub-wide cache _refresh_underlying_quotes keeps warm."""
+        reading the hub-wide cache _refresh_underlying_quotes keeps warm.
+
+        spot_price itself is overridden from broker_ticker_manager.get_spot()
+        when the ticker has a live value for this instrument — that's the
+        same in-memory, WS-tick-driven spot_map dhan_ticker.py's binary
+        handler updates on every real trade (sub-second), so it's a plain
+        dict read here, not I/O, same as the ltp_map reads _collect_changed_ltp
+        already does in this same hot loop. Previously spot_price came ONLY
+        from _underlying_quote_cache, which _refresh_underlying_quotes only
+        refills every REST_REFRESH_INTERVAL_SECONDS via an actual Dhan REST
+        call — confirmed live that made the chart's candle update roughly
+        every ~3s (REST round-trip latency stacked on top of the poll
+        interval) instead of genuinely tick-by-tick. previous_close/
+        change_pct/ohlc still come from that slower REST-backed cache (those
+        don't need to be live), only spot_price is now ticker-first with the
+        REST-cached value as fallback for an instrument the ticker isn't
+        subscribed to (e.g. a stock underlying with no chain warmed yet)."""
+        from features.broker_gateway import broker_ticker_manager
         changed: list[dict] = []
         for instrument, quote in self._underlying_quote_cache.items():
             spot_price = float(quote.get("spot_price") or 0)
+            live_spot = broker_ticker_manager.get_spot(instrument)
+            if live_spot:
+                spot_price = float(live_spot)
             if spot_price <= 0 or session.last_sent_underlying.get(instrument) == spot_price:
                 continue
             session.last_sent_underlying[instrument] = spot_price
+            prev_close = float(quote.get("previous_close") or 0)
+            change_pct = round((spot_price - prev_close) / prev_close * 100, 2) if prev_close > 0 else quote.get("change_pct")
+            change_points = round(spot_price - prev_close, 2) if prev_close > 0 else quote.get("change_points")
             changed.append({
                 "instrument": instrument,
                 "spot_price": spot_price,
-                "change_pct": quote.get("change_pct"),
-                "change_points": quote.get("change_points"),
+                "change_pct": change_pct,
+                "change_points": change_points,
                 "previous_close": quote.get("previous_close"),
             })
         return changed
@@ -549,6 +832,11 @@ class _LiveQuoteHub:
              separate Dhan /positions REST call: the tokens are already
              flowing through this socket, so resolving token → instrument is
              a single indexed Mongo lookup, no extra broker API hit at all.
+          4. Whichever index/stock underlyings are currently attach_instrument'd
+             by any chart session (instrument_ref_manager "UL:{instrument}" keys,
+             see _handle_attach_instrument) — covers a chart open on a plain
+             equity/index with no strategy or option leg behind it at all,
+             which sources 1-3 above have no way to see.
 
         Reuses features.execution_socket._fetch_dhan_index_quotes, which
         already prices both indices (IDX_I) and individual F&O stocks
@@ -561,6 +849,7 @@ class _LiveQuoteHub:
         """
         from features.mongo_data import MongoData
         from features.execution_socket import _fetch_dhan_index_quotes
+        from features.instrument_ref_manager import active_keys as _ref_active_keys
 
         async with self._lock:
             subscribed_tokens = set()
@@ -570,6 +859,9 @@ class _LiveQuoteHub:
         db = MongoData()
         try:
             instruments = set(ALWAYS_TRACKED_UNDERLYINGS)
+            instruments |= {
+                key[3:] for key in _ref_active_keys() if key.startswith("UL:")
+            }
             instruments |= {
                 str(doc.get("instrument") or "").strip().upper()
                 for doc in db._db["simulator_strategy"].find(

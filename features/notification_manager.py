@@ -342,14 +342,20 @@ def record_entry_taken(
     trail_cfg   = leg_cfg.get('LegTrailSL')  or {}
 
     entry_price = _safe_float(entry_trade.get('price'))
+    entry_spot  = _safe_float(
+        entry_trade.get('spot_price')
+        or entry_trade.get('underlying_at_trade')
+        or entry_trade.get('underlying_trigger_price')
+    ) or None
     sl_value    = _safe_float(sl_config.get('Value'))
     tp_value    = _safe_float(tp_config.get('Value'))
 
     # compute absolute SL and TP price for display
     is_sell = 'sell' in str(leg.get('position') or '').lower()
+    option_type = str(leg.get('option') or '')
     from features.position_manager import calc_sl_price, calc_tp_price
-    sl_price = calc_sl_price(entry_price, is_sell, sl_config)
-    tp_price = calc_tp_price(entry_price, is_sell, tp_config)
+    sl_price = calc_sl_price(entry_price, is_sell, sl_config, entry_spot, option_type)
+    tp_price = calc_tp_price(entry_price, is_sell, tp_config, entry_spot, option_type)
 
     doc = _base(
         meta['strategy_id'], trade_id, 'entry_taken', timestamp,
@@ -1358,7 +1364,12 @@ def _build_leg_entry_description(
     sl_trigger_price = None
     if 'None' not in sl_type and sl_type and sl_val > 0:
         from features.position_manager import calc_sl_price
-        sl_trigger_price = calc_sl_price(entry_price, is_sell, sl_cfg)
+        _entry_spot = _safe_float(
+            entry_trade.get('spot_price')
+            or entry_trade.get('underlying_at_trade')
+            or entry_trade.get('underlying_trigger_price')
+        ) or None
+        sl_trigger_price = calc_sl_price(entry_price, is_sell, sl_cfg, _entry_spot, option_type)
         sl_kind          = 'Percentage' if 'Percentage' in sl_type else 'Points'
         rise_fall        = 'rises' if is_sell else 'falls'
         if sl_kind == 'Percentage':
@@ -1441,7 +1452,13 @@ def record_leg_features_at_entry(
 
     entry_trade = leg.get('entry_trade') or {}
     entry_price = _safe_float(entry_trade.get('price'))
+    entry_spot  = _safe_float(
+        entry_trade.get('spot_price')
+        or entry_trade.get('underlying_at_trade')
+        or entry_trade.get('underlying_trigger_price')
+    ) or None
     is_sell     = 'sell' in str(leg.get('position') or '').lower()
+    option_type = str(leg.get('option') or '')
 
     from features.position_manager import calc_sl_price, calc_tp_price
 
@@ -1452,7 +1469,7 @@ def record_leg_features_at_entry(
     sl_type = str(sl_cfg.get('Type') or '')
     sl_val  = _safe_float(sl_cfg.get('Value'))
     if 'None' not in sl_type and sl_type and sl_val > 0:
-        sl_trigger_price = calc_sl_price(entry_price, is_sell, sl_cfg)
+        sl_trigger_price = calc_sl_price(entry_price, is_sell, sl_cfg, entry_spot, option_type)
         sl_kind = 'Percentage' if 'Percentage' in sl_type else 'Points'
         if is_sell:
             description = (
@@ -1497,7 +1514,7 @@ def record_leg_features_at_entry(
     tp_type = str(tp_cfg.get('Type') or '')
     tp_val  = _safe_float(tp_cfg.get('Value'))
     if 'None' not in tp_type and tp_type and tp_val > 0:
-        tp_trigger_price = calc_tp_price(entry_price, is_sell, tp_cfg)
+        tp_trigger_price = calc_tp_price(entry_price, is_sell, tp_cfg, entry_spot, option_type)
         tp_kind = 'Percentage' if 'Percentage' in tp_type else 'Points'
         if is_sell:
             description = (

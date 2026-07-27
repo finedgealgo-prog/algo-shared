@@ -6,8 +6,10 @@ Works identically for backtest, live-trade, and forward-test.
 
 Public API — Leg level
 ──────────────────────
-    calc_sl_price(entry_price, is_sell, sl_config)          → float | None
-    calc_tp_price(entry_price, is_sell, tp_config)          → float | None
+    calc_sl_price(entry_price, is_sell, sl_config, entry_spot=None, option_type=None)   → float | None
+    calc_tp_price(entry_price, is_sell, tp_config, entry_spot=None, option_type=None)   → float | None
+    is_underlying_config(config)                            → bool
+    underlying_direction_is_sell(is_sell, option_type)      → bool  (CE/PE direction flip for spot-based SL/TP)
     is_sl_hit(current_price, sl_price, is_sell)             → bool
     is_tp_hit(current_price, tp_price, is_sell)             → bool
     update_trail_sl(entry_price, current_price,
@@ -45,8 +47,8 @@ Public API — Reentry / Lazy leg builders
 Config field reference
 ──────────────────────
 Leg-level fields (inside ListOfLegConfigs / IdleLegConfigs items):
-    LegStopLoss   : {Type, Value}                    — Points | Percentage
-    LegTarget     : {Type, Value}                    — Points | Percentage
+    LegStopLoss   : {Type, Value}                    — Points | Percentage | UnderlyingPoints | UnderlyingPercentage
+    LegTarget     : {Type, Value}                    — Points | Percentage | UnderlyingPoints | UnderlyingPercentage
     LegTrailSL    : {Type, Value:{InstrumentMove, StopLossMove}}
     LegMomentum   : {Type, Value}
     LegReentrySL  : {Type, Value}                    — Immediate | AtCost | LikeOriginal | NextLeg
@@ -94,14 +96,62 @@ def _is_sell(position_str: str) -> bool:
 # LEG-LEVEL SL / TARGET / TRAIL
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def calc_sl_price(entry_price: float, is_sell: bool, sl_config: dict) -> float | None:
+def is_underlying_config(config: dict) -> bool:
     """
-    Compute absolute SL trigger price from entry_price and LegStopLoss config.
+    True if an SL/Target config's Type is underlying(spot)-based
+    (LegTgtSLType.UnderlyingPoints / UnderlyingPercentage) rather than
+    premium-based. Underlying-based SL/TP must be monitored against the
+    index spot price, not the option's own LTP, and cannot be placed as
+    a broker-native SL/target order on the option (the broker has no way
+    to watch the underlying index for an option order).
+    """
+    return 'Underlying' in str((config or {}).get('Type') or '')
 
-    Config format: {Type: "LegTgtSLType.Percentage" | "LegTgtSLType.Points", Value: float}
 
-    Sell position: SL is ABOVE entry (loss if price goes up)
-    Buy  position: SL is BELOW entry (loss if price goes down)
+def underlying_direction_is_sell(is_sell: bool, option_type: str | None) -> bool:
+    """
+    Effective 'is_sell' to use for underlying(spot)-based SL/TP math and
+    hit-comparisons.
+
+    Premium-based SL/TP direction depends only on position (Sell/Buy) — a
+    short option's own premium always rises when the position is in trouble,
+    whether it's a CE or a PE. Underlying(spot)-based SL/TP is different: a
+    short CE loses when spot rises, but a short PE loses when spot *falls* —
+    the opposite direction for the same position side. This flips the
+    direction for PE legs so the shared up/down formula in calc_sl_price /
+    calc_tp_price / is_sl_hit / is_tp_hit stays correct for both option types.
+    """
+    is_put = 'PE' in str(option_type or '').upper()
+    return (not is_sell) if is_put else is_sell
+
+
+def calc_sl_price(
+    entry_price: float,
+    is_sell: bool,
+    sl_config: dict,
+    entry_spot: float | None = None,
+    option_type: str | None = None,
+) -> float | None:
+    """
+    Compute absolute SL trigger price from LegStopLoss config.
+
+    Config format: {Type: "LegTgtSLType.Percentage" | "LegTgtSLType.Points" |
+                     "LegTgtSLType.UnderlyingPercentage" | "LegTgtSLType.UnderlyingPoints",
+                     Value: float}
+
+    Underlying-* types are based on the index spot price at entry (entry_spot),
+    not the option premium (entry_price). 'Underlying' must be checked before
+    'Percentage'/'Points' below, since "UnderlyingPoints" also contains the
+    substring "Points" and would otherwise be misread as a premium-points SL.
+
+    Sell position: SL is ABOVE base (loss if price goes up)
+    Buy  position: SL is BELOW base (loss if price goes down)
+    For underlying-based SL, "up"/"down" is relative to spot and flips for PE
+    legs — see underlying_direction_is_sell(). option_type ("CE"/"PE") must be
+    supplied for underlying-based SL to get the right side.
+
+    Returns None if underlying-based but entry_spot wasn't supplied — callers
+    must not silently fall back to the option premium for an underlying SL.
     """
     if not sl_config:
         return None
@@ -109,20 +159,38 @@ def calc_sl_price(entry_price: float, is_sell: bool, sl_config: dict) -> float |
     sl_value = _safe_float(sl_config.get('Value'))
     if 'None' in sl_type or sl_value <= 0:
         return None
+    if is_underlying_config(sl_config):
+        base = _safe_float(entry_spot)
+        if base <= 0:
+            return None
+        is_sell = underlying_direction_is_sell(is_sell, option_type)
+    else:
+        base = entry_price
     if 'Percentage' in sl_type:
         mult = (1 + sl_value / 100) if is_sell else (1 - sl_value / 100)
-        return round(entry_price * mult, 2)
+        return round(base * mult, 2)
     if 'Points' in sl_type:
-        return round(entry_price + sl_value if is_sell else entry_price - sl_value, 2)
+        return round(base + sl_value if is_sell else base - sl_value, 2)
     return None
 
 
-def calc_tp_price(entry_price: float, is_sell: bool, tp_config: dict) -> float | None:
+def calc_tp_price(
+    entry_price: float,
+    is_sell: bool,
+    tp_config: dict,
+    entry_spot: float | None = None,
+    option_type: str | None = None,
+) -> float | None:
     """
-    Compute absolute Target trigger price from entry_price and LegTarget config.
+    Compute absolute Target trigger price from LegTarget config.
 
-    Sell position: TP is BELOW entry (profit if price drops)
-    Buy  position: TP is ABOVE entry (profit if price rises)
+    Underlying-* types are based on the index spot price at entry (entry_spot),
+    not the option premium, and flip direction for PE legs — see calc_sl_price
+    / underlying_direction_is_sell() for details. option_type ("CE"/"PE") must
+    be supplied for underlying-based Target to get the right side.
+
+    Sell position: TP is BELOW base (profit if price drops)
+    Buy  position: TP is ABOVE base (profit if price rises)
     """
     if not tp_config:
         return None
@@ -130,11 +198,18 @@ def calc_tp_price(entry_price: float, is_sell: bool, tp_config: dict) -> float |
     tp_value = _safe_float(tp_config.get('Value'))
     if 'None' in tp_type or tp_value <= 0:
         return None
+    if is_underlying_config(tp_config):
+        base = _safe_float(entry_spot)
+        if base <= 0:
+            return None
+        is_sell = underlying_direction_is_sell(is_sell, option_type)
+    else:
+        base = entry_price
     if 'Percentage' in tp_type:
         mult = (1 - tp_value / 100) if is_sell else (1 + tp_value / 100)
-        return round(entry_price * mult, 2)
+        return round(base * mult, 2)
     if 'Points' in tp_type:
-        return round(entry_price - tp_value if is_sell else entry_price + tp_value, 2)
+        return round(base - tp_value if is_sell else base + tp_value, 2)
     return None
 
 
@@ -684,17 +759,27 @@ def check_leg_exit(
     current_sl: float | None,
     is_sell: bool,
     leg_cfg: dict,
+    entry_spot: float | None = None,
+    current_spot: float | None = None,
+    option_type: str | None = None,
 ) -> LegCheckResult:
     """
     One-stop function: check SL hit, TP hit, and update trail SL for a live leg.
 
     Parameters
     ----------
-    entry_price   : original entry price of the leg
-    current_price : latest market price
+    entry_price   : original entry price of the leg (option premium)
+    current_price : latest option premium
     current_sl    : stored SL price from DB (None = compute fresh from config)
     is_sell       : True for sell positions
     leg_cfg       : leg config dict (from ListOfLegConfigs / IdleLegConfigs)
+    entry_spot    : index spot price at entry (required if LegStopLoss/LegTarget
+                    is UnderlyingPoints/UnderlyingPercentage)
+    current_spot  : latest index spot price (required for the same underlying-based
+                    types — SL/TP are compared against spot, not the option premium)
+    option_type   : "CE"/"PE" — required for underlying-based SL/TP, since the
+                    harmful spot direction for a given position flips between
+                    CE and PE (see underlying_direction_is_sell)
 
     Returns LegCheckResult with sl_hit, tp_hit, new_sl_price, exit_reason.
     """
@@ -702,19 +787,26 @@ def check_leg_exit(
     tp_config  = leg_cfg.get('LegTarget')   or {}
     trail_cfg  = get_trail_config(leg_cfg)
 
-    initial_sl = calc_sl_price(entry_price, is_sell, sl_config)
+    initial_sl = calc_sl_price(entry_price, is_sell, sl_config, entry_spot, option_type)
     sl_price = current_sl or initial_sl
-    tp_price = calc_tp_price(entry_price, is_sell, tp_config)
+    tp_price = calc_tp_price(entry_price, is_sell, tp_config, entry_spot, option_type)
 
-    # Apply trail SL update
+    # Apply trail SL update — trail is always premium-based (no Underlying TrailSLType)
     new_sl = sl_price
     if sl_price and trail_cfg:
         new_sl = update_trail_sl(entry_price, current_price, sl_price, is_sell, trail_cfg, initial_sl=initial_sl)
 
-    if is_sl_hit(current_price, new_sl, is_sell):
+    sl_is_underlying = is_underlying_config(sl_config)
+    tp_is_underlying = is_underlying_config(tp_config)
+    sl_compare_price = current_spot if sl_is_underlying else current_price
+    tp_compare_price = current_spot if tp_is_underlying else current_price
+    sl_direction = underlying_direction_is_sell(is_sell, option_type) if sl_is_underlying else is_sell
+    tp_direction = underlying_direction_is_sell(is_sell, option_type) if tp_is_underlying else is_sell
+
+    if sl_compare_price and is_sl_hit(sl_compare_price, new_sl, sl_direction):
         return LegCheckResult(sl_hit=True, new_sl_price=new_sl or 0.0, exit_reason='stoploss')
 
-    if is_tp_hit(current_price, tp_price, is_sell):
+    if tp_compare_price and is_tp_hit(tp_compare_price, tp_price, tp_direction):
         return LegCheckResult(tp_hit=True, new_sl_price=new_sl or 0.0, exit_reason='target')
 
     return LegCheckResult(new_sl_price=new_sl or 0.0)

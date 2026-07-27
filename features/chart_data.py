@@ -254,6 +254,119 @@ def _resolve_stock_dhan_security_id(stock: dict[str, Any]) -> tuple[str, str]:
     return symbol, nse_id
 
 
+def _resolve_nearest_future_contract(instrument: str) -> dict[str, Any] | None:
+    """Nearest-expiry Dhan future contract for `instrument`, from the same
+    active_option_tokens catalog live_quote_socket.py's _lookup_contract and
+    dhan_ticker.py's _resolve_dhan_exchange_segments already read (token,
+    ws_segment, expiry, symbol) — no separate futures data source needed.
+    Futures have no strike (see live_quote_socket.py's is_future convention:
+    strike is always stored as 0.0), so this only needs instrument + option_type=FUT.
+    """
+    today = datetime.utcnow().strftime("%Y-%m-%d")
+    db = MongoData()._db
+    doc = db["active_option_tokens"].find_one(
+        {
+            "instrument": instrument.upper(),
+            "option_type": "FUT",
+            "broker": "dhan",
+            "expiry": {"$gte": today},
+        },
+        {"_id": 0, "token": 1, "tokens": 1, "ws_segment": 1, "expiry": 1, "symbol": 1},
+        sort=[("expiry", 1)],
+    )
+    if not doc:
+        return None
+    token = str(doc.get("token") or doc.get("tokens") or "").strip()
+    if not token:
+        return None
+    return {
+        "token": token,
+        "ws_segment": str(doc.get("ws_segment") or "NSE_FNO").strip().upper(),
+        "expiry": str(doc.get("expiry") or "")[:10],
+        "symbol": str(doc.get("symbol") or f"{instrument.upper()}FUT"),
+    }
+
+
+def get_option_expiries(instrument: str) -> list[str]:
+    """Distinct, not-yet-expired expiry dates for `instrument`'s option chain
+    (CE/PE only — futures aren't part of this picker) — backs the chart's
+    option expiry/strike picker's first step."""
+    instrument = str(instrument or "").strip().upper()
+    if not instrument:
+        return []
+    today = datetime.utcnow().strftime("%Y-%m-%d")
+    db = MongoData()._db
+    expiries = db["active_option_tokens"].distinct(
+        "expiry",
+        {
+            "instrument": instrument,
+            "option_type": {"$in": ["CE", "PE"]},
+            "broker": "dhan",
+            "expiry": {"$gte": today},
+        },
+    )
+    return sorted(str(e)[:10] for e in expiries if e)
+
+
+def get_option_strikes(instrument: str, expiry: str) -> list[dict[str, Any]]:
+    """Strikes available for `instrument` at `expiry`, with which side (CE/PE)
+    each has a live contract for — second step of the chart's option picker,
+    after an expiry from get_option_expiries has been chosen."""
+    instrument = str(instrument or "").strip().upper()
+    expiry = str(expiry or "").strip()[:10]
+    if not instrument or not expiry:
+        return []
+    db = MongoData()._db
+    by_strike: dict[float, dict[str, Any]] = {}
+    for doc in db["active_option_tokens"].find(
+        {
+            "instrument": instrument,
+            "expiry": expiry,
+            "option_type": {"$in": ["CE", "PE"]},
+            "broker": "dhan",
+        },
+        {"_id": 0, "strike": 1, "option_type": 1},
+    ):
+        try:
+            strike = float(doc.get("strike"))
+        except (TypeError, ValueError):
+            continue
+        option_type = str(doc.get("option_type") or "").strip().upper()
+        if option_type not in ("CE", "PE"):
+            continue
+        entry = by_strike.setdefault(strike, {"strike": strike, "CE": False, "PE": False})
+        entry[option_type] = True
+    return [by_strike[k] for k in sorted(by_strike.keys())]
+
+
+def _resolve_option_contract(instrument: str, expiry: str, strike: float, option_type: str) -> dict[str, Any] | None:
+    """Same lookup shape as live_quote_socket.py's _lookup_contract (kept as
+    a separate local query rather than a cross-module import, matching how
+    that module and this one already each keep their own small copy of this
+    active_option_tokens lookup rather than sharing one)."""
+    db = MongoData()._db
+    doc = db["active_option_tokens"].find_one(
+        {
+            "instrument": instrument.upper(),
+            "expiry": str(expiry or "").strip()[:10],
+            "strike": strike,
+            "option_type": option_type,
+            "broker": "dhan",
+        },
+        {"_id": 0, "token": 1, "tokens": 1, "ws_segment": 1, "symbol": 1},
+    )
+    if not doc:
+        return None
+    token = str(doc.get("token") or doc.get("tokens") or "").strip()
+    if not token:
+        return None
+    return {
+        "token": token,
+        "ws_segment": str(doc.get("ws_segment") or "NSE_FNO").strip().upper(),
+        "symbol": str(doc.get("symbol") or ""),
+    }
+
+
 def search_symbol_universe(query: str, limit: int = 30) -> list[dict[str, Any]]:
     """Combined index + stock + commodity list for the chart's TradingView
     "Symbol Search" popup. Empty query returns a curated default (every
@@ -329,6 +442,34 @@ def search_symbol_universe(query: str, limit: int = 30) -> list[dict[str, Any]]:
                     "description": underlying,
                     "exchange": "MCX",
                     "type": "commodity",
+                })
+
+    if len(results) < limit:
+        # One result per instrument (nearest expiry, resolved lazily in
+        # get_symbol_historical_chart_bars/_resolve_nearest_future_contract),
+        # not one per contract — same "pick the underlying, resolve the
+        # actual contract later" shape as the commodity front-month branch
+        # above, just sourced from active_option_tokens (NSE/BSE F&O) instead
+        # of Dhan's commodity master.
+        db = MongoData()._db
+        today = datetime.utcnow().strftime("%Y-%m-%d")
+        instruments = sorted(
+            db["active_option_tokens"].distinct(
+                "instrument",
+                {"broker": "dhan", "option_type": "FUT", "expiry": {"$gte": today}},
+            )
+        )
+        for instrument in instruments:
+            if len(results) >= limit:
+                break
+            instrument = str(instrument or "").strip().upper()
+            if instrument and matches(instrument):
+                results.append({
+                    "symbol": instrument,
+                    "full_name": f"{instrument} FUT (nearest expiry)",
+                    "description": f"{instrument}FUT",
+                    "exchange": "NSE",
+                    "type": "future",
                 })
 
     return results[:limit]
@@ -531,6 +672,9 @@ def get_symbol_historical_chart_bars(
     from_ts: int | None = None,
     to_ts: int | None = None,
     resolution: str = "1D",
+    expiry: str | None = None,
+    strike: float | None = None,
+    option_type: str | None = None,
 ) -> dict[str, Any]:
     """Generalized OHLCV bars for any chart symbol-search result. Indices
     delegate straight to get_index_historical_chart_bars (left completely
@@ -541,6 +685,11 @@ def get_symbol_historical_chart_bars(
     of the chunk-day-limit/caching/bar-formatting logic from
     get_index_historical_chart_bars rather than refactoring that function,
     to avoid any risk to its existing callers.
+
+    expiry/strike/option_type are only used (and required) when symbol_type
+    is "option" — `symbol` alone is just the instrument (e.g. "NIFTY"), not
+    enough on its own to pick one contract out of a whole chain, unlike
+    stock/commodity/future/index where the instrument alone is unambiguous.
     """
     symbol = str(symbol or "").strip()
     if not symbol:
@@ -551,8 +700,18 @@ def get_symbol_historical_chart_bars(
     if symbol_type == "index":
         return get_index_historical_chart_bars(symbol, from_ts=from_ts, to_ts=to_ts, resolution=resolution)
 
-    if symbol_type not in ("stock", "commodity"):
+    if symbol_type not in ("stock", "commodity", "future", "option"):
         raise ValueError(f"Unsupported symbol_type={symbol_type}")
+
+    option_contract: dict[str, Any] | None = None
+    if symbol_type == "option":
+        expiry = str(expiry or "").strip()[:10]
+        option_type = str(option_type or "").strip().upper()
+        if not expiry or option_type not in ("CE", "PE") or strike is None:
+            raise ValueError("expiry, strike and option_type are required for symbol_type=option")
+        option_contract = _resolve_option_contract(symbol, expiry, float(strike), option_type)
+        if not option_contract:
+            raise ValueError(f"No option contract found for symbol={symbol} expiry={expiry} strike={strike} option_type={option_type}")
 
     now_utc = datetime.utcnow()
     from_date = datetime.utcfromtimestamp(from_ts) if from_ts is not None else datetime(2018, 1, 1)
@@ -563,7 +722,11 @@ def get_symbol_historical_chart_bars(
     is_intraday = resolution in _KITE_INTRADAY_RESOLUTION_MAP or resolution in _DHAN_INTRADAY_RESOLUTION_MAP
     # MCX has no Kite path anywhere in this codebase — commodities always go
     # through Dhan regardless of which broker the app currently has active.
-    broker = "dhan" if symbol_type == "commodity" else _get_active_market_data_broker()
+    # Futures/options resolve through active_option_tokens (Dhan-only
+    # catalog, see _resolve_nearest_future_contract/_resolve_option_contract)
+    # same as commodities resolve through Dhan's commodity master — none of
+    # the three have a Kite path wired here.
+    broker = "dhan" if symbol_type in ("commodity", "future", "option") else _get_active_market_data_broker()
 
     if not is_intraday:
         max_chunk_days = HISTORICAL_CHUNK_DAYS if broker == "kite" else DHAN_HISTORICAL_CHUNK_DAYS
@@ -578,7 +741,10 @@ def get_symbol_historical_chart_bars(
     if (effective_to - effective_from) > max_chunk_span:
         effective_from = max(from_date, effective_to - max_chunk_span)
 
-    cache_key = f"{symbol_type}:{symbol.upper()}:{resolution}:{broker}:{int(effective_from.timestamp())}:{int(effective_to.timestamp())}"
+    # For options, symbol alone isn't a unique cache identity (many contracts
+    # share the same instrument) — fold the resolved contract's own token in.
+    cache_symbol_part = f"{symbol.upper()}:{option_contract['token']}" if option_contract else symbol.upper()
+    cache_key = f"{symbol_type}:{cache_symbol_part}:{resolution}:{broker}:{int(effective_from.timestamp())}:{int(effective_to.timestamp())}"
     cached = _index_history_chunk_cache.get(cache_key)
     if cached and (time.time() - cached[0]) <= _INDEX_HISTORY_CACHE_TTL_SECONDS:
         return cached[1]
@@ -643,6 +809,47 @@ def get_symbol_historical_chart_bars(
                     candles = _fetch_dhan_daily_candles(
                         access_token, dhan_security_id, "NSE_EQ", "EQUITY", effective_from, effective_to
                     )
+        elif symbol_type == "future":  # nearest-expiry NSE/BSE F&O future, always Dhan
+            contract = _resolve_nearest_future_contract(symbol)
+            if not contract:
+                raise ValueError(f"No future contract found for symbol={symbol}")
+            _, access_token = _load_dhan_credentials_any()
+            if not access_token:
+                raise ValueError("Active Dhan access token not configured.")
+            # FUTIDX for index underlyings (NIFTY/BANKNIFTY/...), FUTSTK for
+            # everything else — same distinction Dhan's own API draws.
+            dhan_instrument = "FUTIDX" if symbol.upper() in DHAN_INDEX_SECURITY_IDS else "FUTSTK"
+            if is_intraday:
+                native_interval, factor, _ = _DHAN_INTRADAY_RESOLUTION_MAP[resolution]
+                candles = _fetch_dhan_intraday_candles(
+                    access_token, contract["token"], contract["ws_segment"], dhan_instrument,
+                    native_interval, effective_from, effective_to,
+                )
+                candles = _aggregate_intraday_candles(candles, factor)
+            else:
+                candles = _fetch_dhan_daily_candles(
+                    access_token, contract["token"], contract["ws_segment"], dhan_instrument,
+                    effective_from, effective_to,
+                )
+        elif symbol_type == "option":  # exact contract, resolved above via _resolve_option_contract
+            _, access_token = _load_dhan_credentials_any()
+            if not access_token:
+                raise ValueError("Active Dhan access token not configured.")
+            # OPTIDX for index underlyings (NIFTY/BANKNIFTY/...), OPTSTK for
+            # everything else — same distinction the FUTIDX/FUTSTK branch above draws.
+            dhan_instrument = "OPTIDX" if symbol.upper() in DHAN_INDEX_SECURITY_IDS else "OPTSTK"
+            if is_intraday:
+                native_interval, factor, _ = _DHAN_INTRADAY_RESOLUTION_MAP[resolution]
+                candles = _fetch_dhan_intraday_candles(
+                    access_token, option_contract["token"], option_contract["ws_segment"], dhan_instrument,
+                    native_interval, effective_from, effective_to,
+                )
+                candles = _aggregate_intraday_candles(candles, factor)
+            else:
+                candles = _fetch_dhan_daily_candles(
+                    access_token, option_contract["token"], option_contract["ws_segment"], dhan_instrument,
+                    effective_from, effective_to,
+                )
         else:  # commodity — always Dhan, front-month FUTCOM contract
             commodity_master = _load_dhan_commodity_master()
             contracts = [

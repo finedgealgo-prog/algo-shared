@@ -37,6 +37,7 @@ from features.indicator_alerts import (
     get_indicator_lookback_seconds,
     seconds_until_next_bar_close,
 )
+from features.alert_events_socket import mark_alert_fired
 from features.chart_data import get_index_historical_chart_bars
 from features.mongo_data import MongoData
 from features.telegram_notifier import notify_user_for
@@ -150,16 +151,16 @@ def _is_time_inside_alert_line(points: list[dict] | None, line_mode: str | None,
     if not points or len(points) < 2:
         return False
     start_time = points[0].get("time")
-    end_time = points[-1].get("time")
-    if start_time is None or end_time is None:
+    if start_time is None:
         return False
-    if line_mode == "extended":
+    # Mirrors Chart.tsx exactly: alert evaluation is always forward-looking,
+    # so even a plain segment keeps extrapolating for every time at or after
+    # its first anchor instead of stopping at the drawn line's right edge.
+    if line_mode in ("extended", "ray_left"):
         return True
-    if line_mode == "ray_left":
-        return t <= end_time
-    if line_mode == "ray_right":
+    if line_mode in ("ray_right", "segment"):
         return t >= start_time
-    return start_time <= t <= end_time
+    return t >= start_time
 
 
 def _chain_needs_bar_close_engine(alert: dict) -> bool:
@@ -202,9 +203,9 @@ def _did_cross_level(prev_price: float, curr_price: float, prev_t: float, curr_t
     crossed_below = prev_price > prev_level and curr_price <= curr_level
 
     if direction == "crosses_above":
-        return "up" if crossed_above else None
+        return "up" if curr_price >= curr_level else None
     if direction == "crosses_below":
-        return "down" if crossed_below else None
+        return "down" if curr_price <= curr_level else None
     # "Greater Than"/"Less Than" are a plain state check, not a crossing
     # transition — matches Chart.tsx's didCrossLevel comment verbatim.
     if direction == "greater_than":
@@ -550,7 +551,17 @@ class _AlertChecker:
                     if now_ms - last_fired >= ONCE_PER_MINUTE_COOLDOWN_MS:
                         direction = touched
             else:
-                direction = _did_cross_level(prev_price, curr_price, prev_t, now_ms, alert)
+                raw_direction = _did_cross_level(prev_price, curr_price, prev_t, now_ms, alert)
+                alert_direction = alert.get("direction")
+                if alert_direction in ("crosses_above", "crosses_below"):
+                    cross_primed = bool(alert.get("crossPrimed"))
+                    if raw_direction:
+                        if cross_primed:
+                            direction = raw_direction
+                    elif not cross_primed:
+                        self._persist_update(alert_id, {"crossPrimed": True})
+                else:
+                    direction = raw_direction
 
             if not direction:
                 continue
@@ -560,6 +571,8 @@ class _AlertChecker:
                 trigger_price = alert.get("price")
 
             field_updates = {"lastTriggeredAt": now_ms}
+            if alert.get("direction") in ("crosses_above", "crosses_below"):
+                field_updates["crossPrimed"] = False
             if trigger_mode == "once_only":
                 field_updates["active"] = False
 
@@ -582,6 +595,24 @@ class _AlertChecker:
         }.get(alert.get("direction") or "", alert.get("direction") or "")
         symbol_label = str(alert.get("symbol") or "").upper()
         line_kind = "Trendline" if source_type == "trendline" else "Price"
+
+        # Backend is the sole authority on when a live alert has actually
+        # fired (see alert_events_socket.py) — push it to every connected
+        # chart tab for this user before anything else below, so the
+        # frontend's popup/list-removal never depends on a Telegram/webhook
+        # outcome (or a browser tab re-deriving the same crossing itself).
+        mark_alert_fired(str(alert.get("user_id") or ""), {
+            "alert_id": alert.get("id"),
+            "name": alert_name,
+            "symbol": symbol_label,
+            "sourceType": source_type,
+            "direction": alert.get("direction"),
+            "triggerMode": alert.get("triggerMode"),
+            "action": alert.get("action"),
+            "message": alert.get("message"),
+            "triggerPrice": float(trigger_price) if trigger_price is not None else None,
+            "deactivated": field_updates.get("active") is False,
+        })
 
         # ── Telegram notification ──────────────────────────────────────────
         # Sent whenever notifyInApp is True (the default) and the user has

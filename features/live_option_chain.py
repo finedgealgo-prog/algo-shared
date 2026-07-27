@@ -27,6 +27,7 @@ import logging
 import math
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
@@ -459,31 +460,35 @@ def _fetch_full_chain_from_dhan(
         log.warning('[DHAN CHAIN] leg=%s chain warm error: %s', leg_id, exc)
     _dlap(f'warm_chain_tokens ({len(all_tok_ids)} tokens)')
 
+    # ── 3a/3c. Quotes (LTP) and WS depth are independent lookups — run them
+    # concurrently instead of stacking their round trips. (The REST depth
+    # fallback still depends on which tokens WS depth missed, so it stays
+    # sequential, right after.)
+    from features.broker_gateway import get_broker_rest_quotes, get_broker_ws_depth, get_broker_rest_depth  # type: ignore
+
     broker_quotes: dict[str, dict] = {}
-    try:
-        from features.broker_gateway import get_broker_rest_quotes  # type: ignore
-        broker_quotes = get_broker_rest_quotes(all_tok_ids, db._db, ws_segments)
-    except Exception as exc:
-        log.warning('[DHAN CHAIN] leg=%s broker_quotes error: %s', leg_id, exc)
+    broker_depth: dict[str, dict] = {}
+    with ThreadPoolExecutor(max_workers=2) as _pool:
+        _fut_quotes = _pool.submit(get_broker_rest_quotes, all_tok_ids, db._db, ws_segments)
+        _fut_depth = _pool.submit(get_broker_ws_depth, all_tok_ids)
+        try:
+            broker_quotes = _fut_quotes.result()
+        except Exception as exc:
+            log.warning('[DHAN CHAIN] leg=%s broker_quotes error: %s', leg_id, exc)
+        try:
+            broker_depth = _fut_depth.result()
+        except Exception as exc:
+            log.warning('[DHAN CHAIN] leg=%s broker_ws_depth error: %s', leg_id, exc)
     ltp_count = sum(1 for v in broker_quotes.values() if v.get('ltp', 0) > 0)
-    _dlap(f'get_broker_rest_quotes (ltp resolved for {ltp_count}/{len(all_tok_ids)}) <-- likely bottleneck: Dhan rate gate')
+    _dlap(f'get_broker_rest_quotes + get_broker_ws_depth in parallel (ltp resolved for {ltp_count}/{len(all_tok_ids)})')
     # [DHAN CHAIN] quotes print suppressed
 
-    # ── 3c. Depth (bid/ask) + previous-day baseline (for oi/ltp change%) ──────
-    # WS-first (chain tokens now subscribe REQ_FULL_SUB, same as live
-    # positions — see dhan_ticker.py's _handle_chain_binary): any token
-    # that's actually ticking already has bid/ask/prev_close in
-    # broker_ticker_manager's maps, zero REST, zero rate-gate. Only tokens
-    # genuinely missing from WS (a chain opened this instant, before its
-    # first Full packet arrived) fall back to the REST path below; the
-    # previous-day baseline is a once-per-session Mongo read (long-TTL
+    # ── 3c continued. REST depth fallback for whatever WS depth missed ────────
+    # (a chain opened this instant, before its first Full packet arrived) —
+    # the previous-day baseline is a once-per-session Mongo read (long-TTL
     # cached in this module), unrelated to either.
-    broker_depth: dict[str, dict] = {}
-    _missing_depth: list[str] = []
+    _missing_depth: list[str] = [t for t in all_tok_ids if t not in broker_depth]
     try:
-        from features.broker_gateway import get_broker_ws_depth, get_broker_rest_depth  # type: ignore
-        broker_depth = get_broker_ws_depth(all_tok_ids)
-        _missing_depth = [t for t in all_tok_ids if t not in broker_depth]
         if _missing_depth:
             broker_depth.update(get_broker_rest_depth(_missing_depth, db._db, ws_segments))
     except Exception as exc:

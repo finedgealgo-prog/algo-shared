@@ -652,11 +652,19 @@ class LiveMonitorService:
                 if not entry_price:
                     continue
 
+                entry_spot = float(
+                    entry_trade.get('spot_price')
+                    or entry_trade.get('underlying_at_trade')
+                    or entry_trade.get('underlying_trigger_price')
+                    or 0
+                ) or None
+
                 is_sell = 'sell' in str(leg.get('position') or '').lower()
+                option_type = str(leg.get('option') or '')
 
                 if not (leg.get('current_sl_price') or leg.get('sl_price')):
                     try:
-                        sl_price = calc_sl_price(entry_price, is_sell, leg_cfg.get('LegStopLoss') or {})
+                        sl_price = calc_sl_price(entry_price, is_sell, leg_cfg.get('LegStopLoss') or {}, entry_spot, option_type)
                         if sl_price:
                             leg['current_sl_price'] = sl_price
                     except Exception:
@@ -664,7 +672,7 @@ class LiveMonitorService:
 
                 if not (leg.get('current_tp_price') or leg.get('tp_price')):
                     try:
-                        tp_price = calc_tp_price(entry_price, is_sell, leg_cfg.get('LegTarget') or {})
+                        tp_price = calc_tp_price(entry_price, is_sell, leg_cfg.get('LegTarget') or {}, entry_spot, option_type)
                         if tp_price:
                             leg['current_tp_price'] = tp_price
                     except Exception:
