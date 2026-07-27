@@ -33,6 +33,8 @@ lives under this one un-domain-prefixed path, deliberately not "/scanner" or
   GET    /v1/indicator-alert-monitor/status      loop, see alert_checker.py
   GET    /v1/symbol_search                      index/stock/commodity search (see scanner/service.py)
   GET    /v1/symbol_historical_chart             OHLCV bars for any of the above
+  WS     /v1/ws/alert-events                     live push the instant an alert fires
+                                                  (see features/alert_events_socket.py)
 """
 
 from __future__ import annotations
@@ -55,13 +57,17 @@ from features.alert_checker import (
     start_indicator_alert_monitor,
     stop_indicator_alert_monitor,
 )
+from features.alert_events_socket import router as alert_events_router
 from features.chart_data import (
+    get_option_expiries,
+    get_option_strikes,
     get_symbol_historical_chart_bars,
     search_symbol_universe,
 )
 from features.mongo_data import MONGO_URI
 
 router = APIRouter(prefix="/v1")
+router.include_router(alert_events_router)
 
 # Was hardcoded to "mongodb://localhost:27017/", bypassing MONGO_URI (the
 # shared toggle every other module routes through) — harmless in local dev
@@ -476,18 +482,47 @@ async def chart_symbol_search(
 
 @router.get("/symbol_historical_chart")
 async def chart_symbol_historical_chart(
-    symbol: str = Query(..., description="Ticker from /v1/symbol_search, e.g. nifty_50, RELIANCE, GOLD"),
-    symbol_type: str = Query(default="index", description="index | stock | commodity"),
+    symbol: str = Query(..., description="Ticker from /v1/symbol_search, e.g. nifty_50, RELIANCE, GOLD, NIFTY (future/option)"),
+    symbol_type: str = Query(default="index", description="index | stock | commodity | future | option"),
     from_ts: Optional[int] = Query(default=None, alias="from"),
     to_ts: Optional[int] = Query(default=None, alias="to"),
     resolution: str = Query(default="1D", description="5/15/30/60/240/480 (minutes) or 1D"),
+    expiry: Optional[str] = Query(default=None, description="Required when symbol_type=option, e.g. 2026-08-28"),
+    strike: Optional[float] = Query(default=None, description="Required when symbol_type=option"),
+    option_type: Optional[str] = Query(default=None, description="Required when symbol_type=option: CE | PE"),
 ) -> dict[str, Any]:
     try:
         return get_symbol_historical_chart_bars(
-            symbol, symbol_type, from_ts=from_ts, to_ts=to_ts, resolution=resolution
+            symbol, symbol_type, from_ts=from_ts, to_ts=to_ts, resolution=resolution,
+            expiry=expiry, strike=strike, option_type=option_type,
         )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+@router.get("/option_expiries")
+async def chart_option_expiries(
+    instrument: str = Query(..., description="e.g. NIFTY, BANKNIFTY, RELIANCE"),
+) -> dict[str, Any]:
+    """Step 1 of the chart's option picker — not-yet-expired expiry dates for
+    `instrument`'s option chain."""
+    try:
+        return {"status": "success", "expiries": get_option_expiries(instrument)}
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+@router.get("/option_strikes")
+async def chart_option_strikes(
+    instrument: str = Query(..., description="e.g. NIFTY, BANKNIFTY, RELIANCE"),
+    expiry: str = Query(..., description="One of the values from /v1/option_expiries, e.g. 2026-08-28"),
+) -> dict[str, Any]:
+    """Step 2 of the chart's option picker — strikes available at `expiry`,
+    with which side (CE/PE) each has a live contract for."""
+    try:
+        return {"status": "success", "strikes": get_option_strikes(instrument, expiry)}
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
