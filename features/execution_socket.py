@@ -1157,7 +1157,9 @@ def _build_mode_entry_order_payload(
         }
 
     leg_id_str = str(leg.get('id') or '')
+    trade_id = str(trade.get('_id') or '')
     broker_quantity = max(0, int(quantity)) * max(1, int(lot_size or 1))
+    from features.monitoring_throttle import mark_order_blocked, mark_order_resolved
     try:
         from features.live_order_manager import place_live_entry_order
 
@@ -1169,15 +1171,20 @@ def _build_mode_entry_order_payload(
             log.warning(
                 '[LIVE ORDER] placement failed leg=%s trade=%s: %s',
                 leg_id_str,
-                str(trade.get('_id') or ''),
+                trade_id,
                 order_error,
             )
+            # Nothing got persisted, so the same entry condition will still be true
+            # on the very next evaluation — but that's normally gated by the trade's
+            # MonitoringMode (could be 30s/60s for Mid Candle/Candle Close). A failed
+            # placement needs a fast retry regardless of that setting; see
+            # monitoring_throttle.mark_order_blocked().
+            mark_order_blocked(trade_id)
             # Config/input-level broker rejections (wrong IP, invalid symbol, etc.) will
             # fail identically on every retry — without bailing out here, the monitor's
             # ~1s loop hits the broker again every tick forever, spamming the same error
             # and blocking the event loop on each failing call. Square off so it stops.
             if _is_terminal_broker_rejection(order_error):
-                trade_id = str(trade.get('_id') or '')
                 log.error(
                     '[LIVE ORDER] terminal broker rejection — squaring off trade=%s leg=%s: %s',
                     trade_id, leg_id_str, order_error,
@@ -1198,6 +1205,7 @@ def _build_mode_entry_order_payload(
                 'error': order_error,
             }
 
+        mark_order_resolved(trade_id)
         payload: dict[str, Any] = {
             'order_id': live_order['order_id'],
             'order_type': live_order['order_type'],
@@ -1215,6 +1223,7 @@ def _build_mode_entry_order_payload(
         }
     except Exception as exc:
         log.error('[LIVE ORDER] entry order error leg=%s: %s', leg_id_str, exc)
+        mark_order_blocked(trade_id)
         from features.telegram_notifier import notify_user
         notify_user('order_placement_failed', f'Entry order error leg={leg_id_str}: {exc}', {'leg_id': leg_id_str})
         return {
@@ -1324,9 +1333,23 @@ def _dispatch_live_exit_order_sync(
             cancel_reason=f'exit_dispatch_replace:{exit_reason}',
         )
 
-        place_live_exit_order(
+        from features.monitoring_throttle import mark_order_blocked, mark_order_resolved
+        exit_order = place_live_exit_order(
             db, trade, leg, leg_cfg, symbol, quantity, exit_price, exit_reason
         )
+        if exit_order and exit_order.get('order_id'):
+            mark_order_resolved(trade_id)
+        else:
+            # Nothing got persisted — the SL/Target condition is still true, so the
+            # next evaluation needs to retry soon regardless of this trade's
+            # MonitoringMode. See monitoring_throttle.mark_order_blocked(): a blocked
+            # exit is exactly the case that throttle exists to fast-track, since an
+            # unprotected open position sitting throttled at 30s/60s is real risk.
+            mark_order_blocked(trade_id)
+            log.warning(
+                '[LIVE EXIT ORDER] placement failed trade=%s leg=%s reason=%s error=%s',
+                trade_id, leg_id, exit_reason, (exit_order or {}).get('error') or 'live_order_failed',
+            )
     except Exception as exc:
         log.error(
             '[LIVE EXIT ORDER] error trade=%s leg=%s: %s',
@@ -1334,6 +1357,8 @@ def _dispatch_live_exit_order_sync(
             leg_id,
             exc,
         )
+        from features.monitoring_throttle import mark_order_blocked
+        mark_order_blocked(str(trade.get('_id') or ''))
         from features.telegram_notifier import notify_user
         notify_user(
             'order_placement_failed',
@@ -3438,12 +3463,14 @@ def _queue_live_broker_pending_momentum_entry(
         log.error('momentum live broker entry error leg=%s: %s', leg_id, exc)
         return False
 
+    from features.monitoring_throttle import mark_order_blocked, mark_order_resolved
     if not broker_entry.get('order_id'):
         momentum_order_error = str(broker_entry.get('error') or 'live_order_failed')
         print(
             f'[MOMENTUM BROKER ORDER BLOCKED] trade={trade_id} leg={leg_id} '
             f'reason={momentum_order_error}'
         )
+        mark_order_blocked(trade_id)
         if _is_terminal_broker_rejection(momentum_order_error):
             log.error(
                 '[MOMENTUM BROKER ORDER] terminal broker rejection — squaring off trade=%s leg=%s: %s',
@@ -7020,6 +7047,204 @@ def _resolve_stable_prev_close(underlying: str, session_day: str, live_prev_clos
     return resolved
 
 
+_DHAN_SCRIP_MASTER_CACHE: dict = {}  # {"rows": [csv_row_dict, ...], "date": "YYYY-MM-DD"}
+
+
+def _get_dhan_scrip_master_rows() -> list[dict]:
+    """
+    Raw Dhan scrip master CSV rows (~30MB file), downloaded once per calendar day
+    and shared by every Dhan contract sync — stocks, indices, anything else —
+    so the file is fetched at most once a day no matter how many instruments sync.
+
+    Duplicated from algo.simulator/api.py's (identical) copy rather than
+    imported from it: this module runs inside every service, including
+    algo.websocket (ws_main.py, no api.py of its own at all — see
+    _fetch_dhan_index_quotes' stock branch below, which used to do
+    `from api import ...` and silently fail there with every stock's live
+    quote quietly never arriving, since that import only resolves under
+    services that happen to have their own api.py).
+    """
+    import io as _io, csv as _csv, requests as _req
+    today_str = datetime.now().strftime("%Y-%m-%d")
+    if _DHAN_SCRIP_MASTER_CACHE.get("rows") and _DHAN_SCRIP_MASTER_CACHE.get("date") == today_str:
+        return _DHAN_SCRIP_MASTER_CACHE["rows"]
+
+    resp = _req.get("https://images.dhan.co/api-data/api-scrip-master.csv", timeout=30)
+    resp.raise_for_status()
+    rows = list(_csv.DictReader(_io.StringIO(resp.text)))
+    _DHAN_SCRIP_MASTER_CACHE["rows"] = rows
+    _DHAN_SCRIP_MASTER_CACHE["date"] = today_str
+    return rows
+
+
+_FNO_MASTER_CACHE: dict = {}        # {"rows": {symbol: [contracts]}, "fetched_at": float}
+_FNO_CACHE_TTL = 3600               # refresh once per hour
+
+
+def _get_dhan_fno_master() -> dict[str, list[dict]]:
+    """
+    Returns {symbol: [{sec_id, strike, opt_type, expiry, exchange}]} from
+    Dhan security master CSV. Cached for 1 hour.
+    Also populates _FNO_MASTER_CACHE["equity_ids"] = {symbol: sec_id} for spot lookup.
+    """
+    import time as _t
+    if _FNO_MASTER_CACHE.get("rows") and (_t.time() - _FNO_MASTER_CACHE.get("fetched_at", 0)) < _FNO_CACHE_TTL:
+        return _FNO_MASTER_CACHE["rows"]
+
+    reader = _get_dhan_scrip_master_rows()
+    master: dict[str, list[dict]] = {}
+    equity_ids: dict[str, str] = {}
+    for row in reader:
+        inst = row.get("SEM_INSTRUMENT_NAME", "").strip()
+        exch = row.get("SEM_EXM_EXCH_ID", "").strip()
+        sec_id = row.get("SEM_SMST_SECURITY_ID", "").strip()
+        ts = row.get("SEM_TRADING_SYMBOL", "").strip()
+
+        # Capture NSE equity security IDs for spot price lookup
+        # Dhan CSV may use EQUITY, ES, EQ or similar for cash equity
+        _deriv_types = {"OPTSTK", "OPTIDX", "FUTSTK", "FUTIDX", "FUTCUR", "OPTCUR", "FUTCOM", "OPTFUT"}
+        if exch == "NSE" and inst not in _deriv_types and ts and sec_id:
+            sym = ts.split("-")[0].strip()
+            if sym and sym not in equity_ids:
+                equity_ids[sym] = sec_id
+
+        if inst != "OPTSTK":
+            continue
+        symbol = ts.split("-")[0].strip() if "-" in ts else ""
+        if not symbol:
+            continue
+        expiry_raw = row.get("SEM_EXPIRY_DATE", "").strip()
+        expiry = expiry_raw[:10] if expiry_raw else ""
+        if not expiry:
+            continue
+        entry = {
+            "sec_id":   sec_id,
+            "strike":   float(row.get("SEM_STRIKE_PRICE") or 0),
+            "opt_type": row.get("SEM_OPTION_TYPE", "").strip().upper(),
+            "expiry":   expiry,
+            "exchange": exch,
+            "lot_size": int(float(row.get("SEM_LOT_UNITS") or 0)),
+        }
+        master.setdefault(symbol, []).append(entry)
+
+    _FNO_MASTER_CACHE["rows"] = master
+    _FNO_MASTER_CACHE["equity_ids"] = equity_ids
+    _FNO_MASTER_CACHE["fetched_at"] = _t.time()
+    return master
+
+
+def _get_dhan_equity_sec_id(symbol: str) -> str:
+    """Return the NSE equity security ID for a stock symbol from Dhan CSV cache."""
+    _get_dhan_fno_master()  # ensure cache is populated
+    return str(_FNO_MASTER_CACHE.get("equity_ids", {}).get(symbol.strip().upper()) or "")
+
+
+_DHAN_MARKET_DATA_LAST_GOOD: dict[str, dict] = {}
+
+
+def _fetch_dhan_market_data(segment: str, sec_ids: list[int], db) -> dict[str, dict]:
+    """
+    Fetch LTP + OI + best bid/ask from Dhan /marketfeed/quote for a list of security IDs.
+    Returns {str(sec_id): {"ltp": float, "oi": int, "bid": float, "ask": float, "prev_close": float}}.
+    Dhan /quote supports up to 1000 per segment — send as few requests as possible.
+
+    WS-first + last-good fallback, same shape as the identical copy in
+    algo.simulator/api.py (see _get_dhan_scrip_master_rows' comment above for
+    why this one's duplicated here rather than imported).
+    """
+    if not sec_ids:
+        return {}
+    raw_db = db._db if hasattr(db, "_db") else db
+    cfg = raw_db["kite_market_config"].find_one({"broker": "dhan", "enabled": True}) or {}
+    access_token = str(cfg.get("access_token") or "").strip()
+    client_id = str(cfg.get("user_id") or cfg.get("dhan_client_id") or "").strip()
+    if not access_token or not client_id:
+        return {}
+
+    result: dict[str, dict] = {}
+
+    try:
+        from features.broker_gateway import broker_ticker_manager as _dtm
+        for sid in sec_ids:
+            sid_str = str(sid)
+            ws_ltp = float(_dtm.ltp_map.get(sid_str) or 0)
+            if ws_ltp > 0:
+                cached = _DHAN_MARKET_DATA_LAST_GOOD.get(f"{segment}:{sid_str}") or {}
+                ws_bid = float(_dtm.bid_map.get(sid_str) or 0)
+                ws_ask = float(_dtm.ask_map.get(sid_str) or 0)
+                ws_bid_qty = int(_dtm.bid_qty_map.get(sid_str) or 0)
+                ws_ask_qty = int(_dtm.ask_qty_map.get(sid_str) or 0)
+                result[sid_str] = {
+                    "ltp": ws_ltp,
+                    "oi": int(_dtm.oi_map.get(sid_str) or cached.get("oi", 0)),
+                    "bid": ws_bid or cached.get("bid", 0.0),
+                    "ask": ws_ask or cached.get("ask", 0.0),
+                    "bid_depth": [{"price": ws_bid, "quantity": ws_bid_qty}] if ws_bid > 0 else cached.get("bid_depth", []),
+                    "ask_depth": [{"price": ws_ask, "quantity": ws_ask_qty}] if ws_ask > 0 else cached.get("ask_depth", []),
+                    "prev_close": cached.get("prev_close", 0.0),
+                    "source": "ws",
+                }
+    except Exception:
+        pass
+
+    missing = [sid for sid in sec_ids if str(sid) not in result]
+    if missing:
+        from features.broker_gateway import dhan_quote_post_blocking
+
+        _BATCH = 500  # Dhan /quote supports up to 1000 per segment
+        batches = [missing[i: i + _BATCH] for i in range(0, len(missing), _BATCH)]
+
+        for batch in batches:
+            for _attempt in range(3):
+                try:
+                    r = dhan_quote_post_blocking({segment: batch}, access_token, client_id, timeout=15.0)
+                    if r is None:
+                        continue
+                    if r.status_code == 200:
+                        raw = r.json()
+                        data = (raw.get("data") or raw).get(segment) or {}
+                        for sid, info in data.items():
+                            if not isinstance(info, dict):
+                                continue
+                            depth = info.get("depth") or {}
+                            buy_levels = depth.get("buy") or []
+                            sell_levels = depth.get("sell") or []
+                            entry = {
+                                "ltp": float(info.get("last_price") or 0),
+                                "oi":  int(info.get("oi") or 0),
+                                "bid": float((buy_levels[0] or {}).get("price") or 0) if buy_levels else 0.0,
+                                "ask": float((sell_levels[0] or {}).get("price") or 0) if sell_levels else 0.0,
+                                "bid_depth": [
+                                    {"price": float(lvl.get("price") or 0), "quantity": int(lvl.get("quantity") or 0)}
+                                    for lvl in buy_levels if float(lvl.get("price") or 0) > 0
+                                ],
+                                "ask_depth": [
+                                    {"price": float(lvl.get("price") or 0), "quantity": int(lvl.get("quantity") or 0)}
+                                    for lvl in sell_levels if float(lvl.get("price") or 0) > 0
+                                ],
+                                "prev_close": float((info.get("ohlc") or {}).get("close") or 0),
+                                "source": "rest",
+                            }
+                            result[str(sid)] = entry
+                            if entry["ltp"] > 0:
+                                _DHAN_MARKET_DATA_LAST_GOOD[f"{segment}:{sid}"] = entry
+                        break
+                    else:
+                        log.warning("[DHAN QUOTE] segment=%s status=%d attempt=%d body=%s",
+                                    segment, r.status_code, _attempt, r.text[:200])
+                except Exception as _e:
+                    log.warning("[DHAN QUOTE] error=%s attempt=%d", _e, _attempt)
+
+    for sid in sec_ids:
+        sid_str = str(sid)
+        if sid_str not in result or not result[sid_str].get("ltp"):
+            cached = _DHAN_MARKET_DATA_LAST_GOOD.get(f"{segment}:{sid_str}")
+            if cached:
+                result[sid_str] = {**cached, "source": "cache"}
+
+    return result
+
+
 def _fetch_dhan_index_quotes(db: MongoData, underlyings: set[str]) -> dict[str, dict[str, float]]:
     """
     One shared {spot_price, change_pct, change_points} object per underlying.
@@ -7128,11 +7353,17 @@ def _fetch_dhan_index_quotes(db: MongoData, underlyings: set[str]) -> dict[str, 
     # master always carries the cash-equity security id for any NSE symbol,
     # quotable via the same /marketfeed/quote endpoint (segment NSE_EQ, one
     # batched call for every stock underlying still missing). Same approach
-    # already proven for the option chain's own stock spot price
-    # (api.py get_live_greeks_chain, NSE_EQ branch) — reused here instead of
-    # duplicated so this function can price *any* underlying, not just the
-    # 6 named indices, and callers (e.g. /simulator/positions/all's
-    # `underlyings` map) get change_pct/change_points for stocks too.
+    # already proven for the option chain's own stock spot price (api.py
+    # get_live_greeks_chain, NSE_EQ branch) — _get_dhan_equity_sec_id/
+    # _fetch_dhan_market_data above are a duplicate of that api.py pair, not
+    # an import of it: this module runs inside every service including
+    # algo.websocket, which has no api.py of its own to import from (that
+    # used to be a lazy `from api import ...` here, silently failing under
+    # algo.websocket specifically — every stock's live quote quietly never
+    # arrived on the live-quote-socket hub even though indices worked fine).
+    # This lets this function price *any* underlying, not just the 6 named
+    # indices, and callers (e.g. /simulator/positions/all's `underlyings`
+    # map) get change_pct/change_points for stocks too.
     #
     # prev_close specifically does NOT come from that NSE_EQ quote's
     # info['prev_close'] (sourced from Dhan's ohlc.close) — confirmed live
@@ -7148,7 +7379,6 @@ def _fetch_dhan_index_quotes(db: MongoData, underlyings: set[str]) -> dict[str, 
     stock_underlyings = [u for u in underlyings if u not in quotes and u not in dhan_spot_ids]
     if stock_underlyings and session_day == today:
         try:
-            from api import _get_dhan_equity_sec_id, _fetch_dhan_market_data  # type: ignore  (lazy: api.py imports this module's package at startup)
             sec_id_by_underlying = {
                 u: sec_id
                 for u in stock_underlyings

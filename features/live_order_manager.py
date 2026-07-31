@@ -120,13 +120,12 @@ def _dhan_broker_kwargs_for_leg(db, trade: dict, expiry, strike, option_type) ->
     try:
         raw_db = db._db if hasattr(db, '_db') else db
         broker_doc_id = str(trade.get('broker') or '').strip()
-        dhan_cfg = raw_db['kite_market_config'].find_one({'broker': 'dhan'}) or {}
-        dhan_id = str(dhan_cfg.get('_id') or '')
-        is_dhan = (
-            (broker_doc_id and broker_doc_id == dhan_id)
-            or (not broker_doc_id and str(dhan_cfg.get('broker') or '').lower() == 'dhan' and dhan_cfg.get('enabled'))
-        )
-        if not is_dhan:
+        if not broker_doc_id:
+            return {}
+        from bson import ObjectId
+        from features.dhan_broker import _is_dhan_doc
+        broker_doc = raw_db['broker_configuration'].find_one({'_id': ObjectId(broker_doc_id)}) or {}
+        if not _is_dhan_doc(broker_doc):
             return {}
         underlying = str(trade.get('underlying') or '').strip().upper()
         doc = raw_db['active_option_tokens'].find_one({
@@ -1684,13 +1683,14 @@ def get_broker_for_trade(db, trade: dict):
     Reads broker_configuration by trade['broker'] ObjectId.
     Detects broker type from doc's `name` / `broker_icon` field:
       - "flattrade" in name/icon → FlatTradeAdapter
+      - "dhan" in name/icon      → DhanAdapter
       - otherwise                → KiteConnect (Zerodha)
 
-    Falls back to default broker via kite_market_config when no broker is mapped
-    on the trade — Kite or Dhan, whichever has enabled=True there. Dhan is only
-    reachable through this global-default fallback today, not as a per-trade
-    selectable broker_configuration account (Dhan credentials live in
-    kite_market_config, not broker_configuration).
+    Returns None when trade['broker'] is unset or the lookup fails — no fallback
+    to kite_market_config. That collection is feed-data-only; a global "whichever
+    account has enabled=True" default would let one user's trade silently place
+    an order through a *different* user's broker account, so every order-placing
+    trade must carry its own explicit broker_configuration account.
     """
     broker_id = str(trade.get('broker') or '').strip()
 
@@ -1721,23 +1721,6 @@ def get_broker_for_trade(db, trade: dict):
                 return get_kite_instance(access_token)
         except Exception as exc:
             log.debug('broker lookup error broker=%s: %s', broker_id, exc)
-
-    # Fallback — default broker via kite_market_config (Kite or Dhan, whichever is enabled)
-    try:
-        market_cfg = db._db['kite_market_config'].find_one({'enabled': True}, {'broker': 1, 'access_token': 1, 'user_id': 1, 'dhan_client_id': 1}) or {}
-        access_token = str(market_cfg.get('access_token') or '').strip()
-        if access_token and str(market_cfg.get('broker') or '').strip().lower() == 'dhan':
-            from features.dhan_broker import get_dhan_instance
-            client_id = str(market_cfg.get('user_id') or market_cfg.get('dhan_client_id') or '').strip()
-            dhan = get_dhan_instance(db, client_id, access_token)
-            if dhan:
-                log.debug('broker=dhan (default) trade=%s', str(trade.get('_id') or ''))
-                return dhan
-        elif access_token:
-            from features.broker_gateway import get_broker_rest_client_with_token as get_kite_instance
-            return get_kite_instance(access_token)
-    except Exception as exc:
-        log.debug('market config token lookup error: %s', exc)
 
     return None
 

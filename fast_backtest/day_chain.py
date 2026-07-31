@@ -32,6 +32,9 @@ class GroupArrays:
     premium: np.ndarray
     oi: np.ndarray
     iv: np.ndarray
+    gamma: np.ndarray
+    theta: np.ndarray
+    vega: np.ndarray
 
 
 class DayChain:
@@ -41,6 +44,7 @@ class DayChain:
                  index: dict[tuple, tuple[int, int]],
                  strike: np.ndarray, delta: np.ndarray, premium: np.ndarray,
                  oi: np.ndarray, iv: np.ndarray,
+                 gamma: np.ndarray, theta: np.ndarray, vega: np.ndarray,
                  spot_by_ts: dict, expiries_by_ts: dict) -> None:
         self.trade_date = trade_date
         self.underlying = underlying
@@ -50,6 +54,9 @@ class DayChain:
         self._premium = premium
         self._oi = oi
         self._iv = iv
+        self._gamma = gamma
+        self._theta = theta
+        self._vega = vega
         self._spot_by_ts = spot_by_ts
         self._expiries_by_ts = expiries_by_ts
         self.timestamps = sorted(spot_by_ts.keys())
@@ -80,11 +87,15 @@ class DayChain:
         premium = df["close"].to_numpy()
         oi = df["oi"].to_numpy()
         iv = df["iv"].to_numpy()
+        gamma = df["gamma"].to_numpy()
+        theta = df["theta"].to_numpy()
+        vega = df["vega"].to_numpy()
 
         spot_map = df.group_by("timestamp", maintain_order=True).agg(pl.col("spot_price").first())
         spot_by_ts = dict(spot_map.iter_rows())
 
-        return cls(trade_date, underlying, index, strike, delta, premium, oi, iv, spot_by_ts, expiries_by_ts)
+        return cls(trade_date, underlying, index, strike, delta, premium, oi, iv,
+                    gamma, theta, vega, spot_by_ts, expiries_by_ts)
 
     def spot(self, timestamp) -> float | None:
         return self._spot_by_ts.get(timestamp)
@@ -103,4 +114,7 @@ class DayChain:
             premium=self._premium[start:end],
             oi=self._oi[start:end],
             iv=self._iv[start:end],
+            gamma=self._gamma[start:end],
+            theta=self._theta[start:end],
+            vega=self._vega[start:end],
         )

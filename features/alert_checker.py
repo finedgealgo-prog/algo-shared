@@ -55,6 +55,11 @@ ONCE_PER_MINUTE_COOLDOWN_MS = 60_000
 # unrelated resolution's boundary.
 INDICATOR_SCHEDULER_MAX_SLEEP_SECONDS = 60.0
 
+# How long fetched trendline bars are reused before refetching from the
+# broker — see _AlertChecker._get_trendline_bars.
+_TRENDLINE_BARS_TTL_SECONDS = 60.0
+_TRENDLINE_BARS_RESOLUTION = "1"
+
 WEBHOOK_TIMEOUT_SECONDS = 8.0
 WEBHOOK_MAX_ATTEMPTS = 3
 WEBHOOK_RETRY_DELAY_SECONDS = [1.0, 2.0]
@@ -136,15 +141,138 @@ def _deliver_webhook(url: str, body: str) -> dict[str, Any]:
     return {"ok": False, "status": last_status, "responseText": last_text}
 
 
+# NSE cash/F&O session: 09:15–15:30 IST, Mon–Fri (holidays not modeled).
+# Mirrors Chart.tsx's tradingMinutesBetween exactly: a trendline's price is
+# interpolated using TRADING-SESSION minutes elapsed between its anchors,
+# not raw wall-clock ms — plain ms math (what this function used to do)
+# counts every market-closed night/weekend an anchor spans as if bars kept
+# forming through it, skewing the slope and every price computed along the
+# line away from what the frontend chart actually renders.
+_IST_OFFSET_MS = 5.5 * 60 * 60 * 1000
+_SESSION_START_MIN = 9 * 60 + 15
+_SESSION_END_MIN = 15 * 60 + 30
+_DAY_MS = 24 * 60 * 60 * 1000
+
+
+def _trading_minutes_between(from_ms: float, to_ms: float) -> float:
+    """Trading-session minutes walking forward from from_ms to to_ms,
+    counting only Mon-Fri 09:15-15:30 IST. Returns 0 if to_ms <= from_ms —
+    callers needing a signed distance use _signed_trading_minutes."""
+    if to_ms <= from_ms:
+        return 0.0
+    total = 0.0
+    cursor = from_ms + _IST_OFFSET_MS
+    end = to_ms + _IST_OFFSET_MS
+    while cursor < end:
+        day_start = cursor - (cursor % _DAY_MS)
+        day_min = (cursor - day_start) / 60000.0
+        dow = int((day_start // _DAY_MS + 4) % 7)  # epoch day 0 (1970-01-01) was a Thursday
+
+        if dow in (0, 6) or day_min >= _SESSION_END_MIN:
+            cursor = day_start + _DAY_MS + _SESSION_START_MIN * 60000
+            continue
+        if day_min < _SESSION_START_MIN:
+            cursor = day_start + _SESSION_START_MIN * 60000
+            continue
+        session_end_today = day_start + _SESSION_END_MIN * 60000
+        segment_end = min(session_end_today, end)
+        total += (segment_end - cursor) / 60000.0
+        cursor = (
+            day_start + _DAY_MS + _SESSION_START_MIN * 60000
+            if segment_end >= session_end_today
+            else segment_end
+        )
+    return total
+
+
+def _signed_trading_minutes(from_ms: float, to_ms: float) -> float:
+    if to_ms >= from_ms:
+        return _trading_minutes_between(from_ms, to_ms)
+    return -_trading_minutes_between(to_ms, from_ms)
+
+
 def _get_trendline_price_at_time(points: list[dict] | None, t: float) -> float | None:
     if not points or len(points) < 2:
         return None
     start, end = points[0], points[-1]
     start_time, end_time = start.get("time"), end.get("time")
+    start_price, end_price = start.get("price"), end.get("price")
     if start_time is None or end_time is None or start_time == end_time:
         return None
-    slope = (end["price"] - start["price"]) / (end_time - start_time)
-    return start["price"] + slope * (t - start_time)
+    if start_price is None or end_price is None:
+        return None
+    total_minutes = _signed_trading_minutes(start_time, end_time)
+    if total_minutes == 0:
+        return None
+    slope_per_minute = (end_price - start_price) / total_minutes
+    return start_price + slope_per_minute * _signed_trading_minutes(start_time, t)
+
+
+def _find_bar_idx(bar_times: list[float], t: float) -> int:
+    """Binary search for the rightmost bar at/before t — mirrors Chart.tsx's
+    findIdx exactly."""
+    lo, hi, result = 0, len(bar_times) - 1, -1
+    while lo <= hi:
+        mid = (lo + hi) // 2
+        if bar_times[mid] <= t:
+            result = mid
+            lo = mid + 1
+        else:
+            hi = mid - 1
+    return result
+
+
+def _get_trendline_price_at_time_from_bars(
+    points: list[dict] | None, t: float, bars: list[dict]
+) -> float | None:
+    """Exact port of Chart.tsx's getTrendlinePriceAtTime: interpolates by
+    BAR INDEX (equal on-screen spacing, same as the frontend chart renders)
+    when real historical bars are available, instead of the idealized
+    trading-calendar approximation _get_trendline_price_at_time falls back
+    to — real bars are exact (they reflect actual holidays/session
+    quirks the calendar model can't know about), so this is what makes the
+    backend's price agree with the frontend down to the same value, not
+    just closely. The still-unformed future portion of the line (beyond the
+    last real bar) has no bars to index into, so that segment is projected
+    using trading-session minutes exactly as _trading_minutes_between does."""
+    if not points or len(points) < 2:
+        return None
+    start, end = points[0], points[-1]
+    start_time, end_time = start.get("time"), end.get("time")
+    start_price, end_price = start.get("price"), end.get("price")
+    if start_time is None or end_time is None or start_time == end_time:
+        return None
+    if start_price is None or end_price is None:
+        return None
+
+    if len(bars) >= 2:
+        bar_times = [float(b["time"]) for b in bars]
+        start_idx = _find_bar_idx(bar_times, start_time)
+        query_idx = _find_bar_idx(bar_times, t)
+        last_bar_time = bar_times[-1]
+
+        if end_time <= last_bar_time:
+            end_idx: float = _find_bar_idx(bar_times, end_time)
+        else:
+            bar_interval = bar_times[-1] - bar_times[-2]
+            for i in range(max(1, len(bar_times) - 5), len(bar_times)):
+                gap = bar_times[i] - bar_times[i - 1]
+                if 0 < gap < bar_interval:
+                    bar_interval = gap
+            future_minutes = _trading_minutes_between(last_bar_time, end_time)
+            bar_interval_minutes = bar_interval / 60000.0
+            end_idx = (len(bar_times) - 1) + (
+                future_minutes / bar_interval_minutes if bar_interval_minutes > 0 else 0.0
+            )
+
+        if start_idx >= 0 and end_idx > start_idx and query_idx >= 0:
+            slope = (end_price - start_price) / (end_idx - start_idx)
+            return start_price + slope * (query_idx - start_idx)
+
+    # Not enough bar history to resolve both anchors (e.g. line drawn
+    # further back than the fetched window) — fall back to the calendar
+    # approximation rather than silently returning a wrong/no value.
+    return _get_trendline_price_at_time(points, t)
 
 
 def _is_time_inside_alert_line(points: list[dict] | None, line_mode: str | None, t: float) -> bool:
@@ -177,25 +305,34 @@ def _chain_needs_bar_close_engine(alert: dict) -> bool:
     return bool(alert.get("additionalConditions"))
 
 
-def _get_alert_price_at_time(alert: dict, t: float) -> float | None:
+def _get_alert_price_at_time(alert: dict, t: float, bars: list[dict] | None = None) -> float | None:
     if alert.get("sourceType") == "trendline":
         points = alert.get("linePoints")
         if not _is_time_inside_alert_line(points, alert.get("lineMode"), t):
             return None
+        if bars:
+            return _get_trendline_price_at_time_from_bars(points, t, bars)
         return _get_trendline_price_at_time(points, t)
     price = alert.get("price")
     return float(price) if isinstance(price, (int, float)) else None
 
 
-def _did_cross_level(prev_price: float, curr_price: float, prev_t: float, curr_t: float, alert: dict) -> str | None:
+def _did_cross_level(
+    prev_price: float,
+    curr_price: float,
+    prev_t: float,
+    curr_t: float,
+    alert: dict,
+    bars: list[dict] | None = None,
+) -> str | None:
     """Tick-level analog of didCrossLevel — prev/curr are two consecutive
     live spot samples instead of two consecutive completed bars."""
     direction = alert.get("direction")
     if direction in _UNIMPLEMENTED_DIRECTIONS:
         return None
 
-    prev_level = _get_alert_price_at_time(alert, prev_t)
-    curr_level = _get_alert_price_at_time(alert, curr_t)
+    prev_level = _get_alert_price_at_time(alert, prev_t, bars)
+    curr_level = _get_alert_price_at_time(alert, curr_t, bars)
     if prev_level is None or curr_level is None:
         return None
 
@@ -242,15 +379,17 @@ def evaluate_trendline_condition(
     if not isinstance(prev_close, (int, float)) or not isinstance(curr_close, (int, float)):
         return None
     pseudo_alert = {"sourceType": "trendline", "direction": direction, "linePoints": line_points, "lineMode": line_mode}
-    crossed = _did_cross_level(float(prev_close), float(curr_close), float(bars[prev]["time"]), float(bars[last]["time"]), pseudo_alert)
+    crossed = _did_cross_level(
+        float(prev_close), float(curr_close), float(bars[prev]["time"]), float(bars[last]["time"]), pseudo_alert, bars
+    )
     return crossed is not None, bar_time
 
 
-def _is_level_touched(price: float, t: float, alert: dict) -> str | None:
+def _is_level_touched(price: float, t: float, alert: dict, bars: list[dict] | None = None) -> str | None:
     direction = alert.get("direction")
     if direction in _UNIMPLEMENTED_DIRECTIONS:
         return None
-    level = _get_alert_price_at_time(alert, t)
+    level = _get_alert_price_at_time(alert, t, bars)
     if level is None:
         return None
     touched_up = price >= level
@@ -276,6 +415,47 @@ class _AlertChecker:
 
     def __init__(self) -> None:
         self._previous_sample: dict[str, tuple[float, float]] = {}
+        self._trendline_bars_cache: dict[str, tuple[float, list[dict]]] = {}
+        # Underlyings we've already attempted to WS-subscribe for live spot
+        # ticks (see run_cycle) — resolved once per process lifetime so the
+        # scrip-master lookup isn't redone on every 2s poll; register_spot_
+        # underlying itself is idempotent, this just skips the redundant call.
+        self._ensured_underlyings: set[str] = set()
+
+    def _get_trendline_bars(self, symbol: str, trendline_alerts: list[dict]) -> list[dict]:
+        """Real historical bars for a symbol's active trendline alerts,
+        cached for _TRENDLINE_BARS_TTL_SECONDS — get_index_historical_chart_
+        bars hits a live broker API, so refetching every 2s poll for every
+        symbol with a trendline alert would hammer it for no reason: bar
+        geometry (used only for the equal-spacing slope math) doesn't need
+        per-poll freshness, only the live tick price — fetched separately,
+        every cycle, from option_chain_index_spot — does."""
+        now = time.time()
+        cached = self._trendline_bars_cache.get(symbol)
+        if cached and now - cached[0] < _TRENDLINE_BARS_TTL_SECONDS:
+            return cached[1]
+
+        anchor_times = [
+            pt.get("time")
+            for alert in trendline_alerts
+            for pt in (alert.get("linePoints") or [])
+            if isinstance(pt.get("time"), (int, float))
+        ]
+        if not anchor_times:
+            return cached[1] if cached else []
+
+        from_ts = int(min(anchor_times) / 1000) - 3600
+        to_ts = int(now)
+        try:
+            result = get_index_historical_chart_bars(
+                symbol, from_ts=from_ts, to_ts=to_ts, resolution=_TRENDLINE_BARS_RESOLUTION
+            )
+            bars = result.get("bars") or []
+        except Exception:
+            logger.exception("[alert_checker] failed to fetch %s trendline bars", symbol)
+            bars = cached[1] if cached else []
+        self._trendline_bars_cache[symbol] = (now, bars)
+        return bars
 
     def run_cycle(self) -> None:
         db = MongoData()._db
@@ -292,6 +472,22 @@ class _AlertChecker:
             _SYMBOL_TO_UNDERLYING.get(str(alert.get("symbol") or "").lower(), str(alert.get("symbol") or "").upper())
             for alert in alerts
         }
+
+        # Indices are always spot-subscribed; a stock underlying only starts
+        # producing option_chain_index_spot documents once something asks the
+        # ticker to subscribe it — an armed webhook is exactly that ask. Without
+        # this, a stock alert's curr_price stays None forever (see the lookup
+        # loop below) and its webhook never fires.
+        new_underlyings = needed_underlyings - self._ensured_underlyings
+        if new_underlyings:
+            try:
+                from features.dhan_ticker import ensure_stock_spot_subscribed
+                for underlying in new_underlyings:
+                    ensure_stock_spot_subscribed(underlying)
+            except Exception:
+                logger.exception("[alert_checker] ensure_stock_spot_subscribed error")
+            self._ensured_underlyings.update(new_underlyings)
+
         current_price_by_underlying: dict[str, float] = {}
         for underlying in needed_underlyings:
             latest = spot_col.find_one({"underlying": underlying}, sort=[("timestamp", -1)])
@@ -317,7 +513,10 @@ class _AlertChecker:
                 # started — nothing to compare against yet.
                 continue
 
-            self._check_alerts(symbol_alerts, prev_price, curr_price, prev_t, now_ms)
+            trendline_alerts = [a for a in symbol_alerts if a.get("sourceType") == "trendline"]
+            bars = self._get_trendline_bars(symbol, trendline_alerts) if trendline_alerts else []
+
+            self._check_alerts(symbol_alerts, prev_price, curr_price, prev_t, now_ms, bars)
 
     def get_active_indicator_resolutions(self) -> set[str]:
         """Distinct BASE resolution values (indicatorResolution) across
@@ -517,7 +716,13 @@ class _AlertChecker:
             )
 
     def _check_alerts(
-        self, alerts: list[dict], prev_price: float, curr_price: float, prev_t: float, now_ms: float
+        self,
+        alerts: list[dict],
+        prev_price: float,
+        curr_price: float,
+        prev_t: float,
+        now_ms: float,
+        bars: list[dict] | None = None,
     ) -> None:
         for alert in alerts:
             alert_id = alert.get("id")
@@ -545,13 +750,26 @@ class _AlertChecker:
             direction: str | None = None
 
             if trigger_mode == "once_per_minute":
-                touched = _is_level_touched(curr_price, now_ms, alert)
+                touched = _is_level_touched(curr_price, now_ms, alert, bars)
                 if touched:
                     last_fired = alert.get("lastTriggeredAt") or 0
                     if now_ms - last_fired >= ONCE_PER_MINUTE_COOLDOWN_MS:
                         direction = touched
             else:
-                raw_direction = _did_cross_level(prev_price, curr_price, prev_t, now_ms, alert)
+                raw_direction = _did_cross_level(prev_price, curr_price, prev_t, now_ms, alert, bars)
+                if alert.get("sourceType") == "trendline":
+                    # TEMP DEBUG — remove once backend trendline price is
+                    # confirmed matching Chart.tsx's own console log for the
+                    # same alert/tick, now that both use real bar-index math.
+                    logger.info(
+                        "[trendline-price-debug] %s trendline_price=%s tick_price=%s primed=%s rawDirection=%s bars=%d",
+                        alert.get("name") or alert_id,
+                        _get_alert_price_at_time(alert, now_ms, bars),
+                        curr_price,
+                        alert.get("crossPrimed"),
+                        raw_direction,
+                        len(bars),
+                    )
                 alert_direction = alert.get("direction")
                 if alert_direction in ("crosses_above", "crosses_below"):
                     cross_primed = bool(alert.get("crossPrimed"))
@@ -566,7 +784,7 @@ class _AlertChecker:
             if not direction:
                 continue
 
-            trigger_price = _get_alert_price_at_time(alert, now_ms)
+            trigger_price = _get_alert_price_at_time(alert, now_ms, bars)
             if trigger_price is None:
                 trigger_price = alert.get("price")
 

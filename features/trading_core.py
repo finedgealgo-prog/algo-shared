@@ -3868,6 +3868,18 @@ def process_broker_tick(
             log.warning('process_broker_tick enrich error trade=%s: %s', str((trade or {}).get('_id') or ''), exc)
 
         trade_id         = str(trade.get('_id') or '')
+
+        # Per-trade "Trade monitoring" cadence gate (on LTP / Mid Candle / on
+        # Candle Close, set via the Edit Execution modal's execution_config_base.
+        # MonitoringMode). Missing/legacy trades default to today's real
+        # per-mode behaviour: continuous ("ltp") for live/fast-forward,
+        # the existing 30s heartbeat ("mid_candle") for forward-test.
+        from features.monitoring_throttle import should_evaluate as _should_evaluate_trade
+        _monitoring_default = 'mid_candle' if ctx.activation_mode == 'forward-test' else 'ltp'
+        _monitoring_mode = (trade.get('execution_config_base') or {}).get('MonitoringMode')
+        if not _should_evaluate_trade(trade_id, _monitoring_mode, default_mode=_monitoring_default):
+            continue
+
         strategy_id      = str(trade.get('strategy_id') or '')
         underlying       = str((trade.get('config') or {}).get('Ticker') or trade.get('ticker') or '')
         strategy_cfg     = trade.get('strategy') or trade.get('config') or {}

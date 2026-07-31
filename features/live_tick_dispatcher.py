@@ -32,12 +32,10 @@ from features.runtime_mode_registry import runtime_mode_registry
 
 logger = logging.getLogger(__name__)
 
-# Forward Test intentionally checks SL/target/lazy-leg/momentum conditions on a
-# slow heartbeat instead of every broker tick — it's a lighter-weight cousin of
-# Fast Forward, not a real-time mode. Ticks that arrive inside the window are
-# simply dropped (the coalescing queue below always keeps the newest one, so
-# the next check runs against current price, not a stale tick).
-FORWARD_TEST_CHECK_INTERVAL_SECONDS = 30.0
+# Forward Test's default heartbeat (for trades without an explicit
+# MonitoringMode) now lives in monitoring_throttle.MONITORING_INTERVAL_SECONDS
+# ("mid_candle" = 30s) — cadence is decided per-trade there, not by a single
+# batch-level gate on this worker anymore.
 
 SPOT_TOKEN_BY_UNDERLYING = {
     "NIFTY":      "256265",
@@ -368,7 +366,12 @@ class _LiveTickDispatcher:
             ).start()
             Thread(
                 target=self._mode_worker_loop,
-                args=("forward-test", self._forward_test_queue, "kite_live", FORWARD_TEST_CHECK_INTERVAL_SECONDS),
+                # No batch-level interval gate anymore — cadence is now decided
+                # per-trade inside process_broker_tick via each trade's own
+                # execution_config_base.MonitoringMode (see monitoring_throttle.py),
+                # so an "on LTP" forward-test trade isn't held hostage by a
+                # "Mid Candle"/"on Candle Close" trade sharing the same worker.
+                args=("forward-test", self._forward_test_queue, "kite_live"),
                 daemon=True,
                 name="forward_test_tick_worker",
             ).start()

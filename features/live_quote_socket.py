@@ -373,6 +373,14 @@ class _LiveQuoteHub:
         await self._detach_current(session)
 
         if kind in ("index", "stock", "commodity"):
+            if kind == "stock":
+                # Indices already ride a permanent WS spot subscription (DB-seeded
+                # _active_spot_tokens); stocks don't until something asks for one —
+                # this is that ask. Once registered, ticks land in spot_map and
+                # _collect_changed_underlyings below takes the same sub-second
+                # WS-tick path indices use instead of the 1.5s REST fallback.
+                from features.dhan_ticker import ensure_stock_spot_subscribed
+                await asyncio.to_thread(ensure_stock_spot_subscribed, instrument)
             session.attached_underlying = instrument
             _ref_acquire(f"UL:{instrument}", "chart", session.session_id)
             await self._send_message(session, "attached", {"instrument": instrument, "kind": kind})

@@ -157,6 +157,43 @@ def _resolve_dhan_exchange_segments(security_ids: list[str]) -> dict[str, str]:
         return {}
 
 
+def ensure_stock_spot_subscribed(underlying: str) -> None:
+    """
+    Resolve a stock symbol's Dhan NSE_EQ security ID and register it as a
+    spot underlying on the live ticker, so its ticks start feeding spot_map
+    (chart tick-by-tick updates) and option_chain_index_spot (the alert/
+    webhook engine) the same way the 6 DB-seeded indices already do.
+
+    No-ops if `underlying` is already a known spot underlying (index or a
+    previously-registered stock) — cheap to call on every chart attach /
+    alert poll. Reuses _get_dhan_equity_sec_id's 1hr-cached scrip-master CSV
+    (execution_socket.py) instead of re-fetching/parsing it here.
+    """
+    ul = str(underlying or "").strip().upper()
+    if not ul or ul in dhan_ticker_manager._active_spot_tokens.values():
+        return
+    try:
+        from features.execution_socket import _get_dhan_equity_sec_id
+        sec_id = _get_dhan_equity_sec_id(ul)
+        if sec_id:
+            dhan_ticker_manager.register_spot_underlying(sec_id, ul, exchange="NSE_EQ")
+    except Exception as exc:
+        logger.warning("[dhan_ticker] ensure_stock_spot_subscribed error underlying=%s: %s", ul, exc)
+
+
+def _prewarm_equity_master() -> None:
+    """Populate execution_socket's 1hr-cached equity-id CSV lookup at ticker
+    startup, so ensure_stock_spot_subscribed's first real call (whichever
+    stock a user attaches/alerts on first) doesn't block on the download."""
+    try:
+        from features.execution_socket import _get_dhan_fno_master, _FNO_MASTER_CACHE
+        _get_dhan_fno_master()  # populates _FNO_MASTER_CACHE["equity_ids"] as a side effect
+        equity_count = len(_FNO_MASTER_CACHE.get("equity_ids") or {})
+        print(f"[DHAN TICKER] equity scrip-master prewarmed equities={equity_count}")
+    except Exception as exc:
+        logger.warning("[dhan_ticker] equity scrip-master prewarm error: %s", exc)
+
+
 class _DhanCompatTicker:
     """
     KiteTicker-compatible shim so existing code that calls
@@ -219,6 +256,14 @@ class _DhanTickerManager:
         self.token_labels: dict[str, str] = {}
         self._active_spot_tokens: dict[str, str] = dict(_DHAN_SPOT_FALLBACK)
         self._active_vix_token: str = _DHAN_VIX_FALLBACK
+        # Every security ID ever subscribed via subscribe_tokens() (option legs,
+        # and now stock spot underlyings) — sid -> exchange. subscribed_tokens
+        # itself is never cleared across a reconnect, so subscribe_tokens()'s own
+        # dedup check silently swallows a resend to a brand-new WS connection;
+        # _on_open replays this dict directly (bypassing that dedup) so a
+        # reconnect doesn't quietly stop ticks for anything subscribed after
+        # the initial spot+vix set. See _run_ws's _on_open.
+        self._dynamic_subscriptions: dict[str, str] = {}
 
         # Compatibility shim so code that does ticker_manager._ticker.subscribe() works
         self._ticker = _DhanCompatTicker(self)
@@ -362,6 +407,17 @@ class _DhanTickerManager:
                 name="dhan_chain_prewarm",
             ).start()
 
+            # Pre-warm the equity scrip-master CSV cache (ensure_stock_spot_
+            # subscribed's resolver) so the FIRST stock any user charts/alerts
+            # on this hour doesn't pay a several-second CSV download+parse cost
+            # before its ticks start flowing — every stock after that already
+            # reuses this same cache regardless of who warmed it.
+            threading.Thread(
+                target=_prewarm_equity_master,
+                daemon=True,
+                name="dhan_equity_master_prewarm",
+            ).start()
+
         return {"ok": True, "message": "Dhan ticker starting"}
 
     def stop(self) -> dict:
@@ -422,6 +478,24 @@ class _DhanTickerManager:
     def get_spot(self, underlying: str) -> float | None:
         return self.spot_map.get(str(underlying or "").upper())
 
+    def register_spot_underlying(self, security_id: str, underlying: str, exchange: str = "NSE_EQ") -> None:
+        """
+        Promote an arbitrary security ID (e.g. a stock's NSE_EQ id) to a spot
+        underlying: from this point on, its ticks land in spot_map/
+        spot_ticks_received exactly like the 6 DB-seeded indices already do
+        (see the `if sid_str in self._active_spot_tokens` branch in
+        _handle_binary), which is what feeds both the chart's tick-by-tick
+        candle updates (live_quote_socket.py) and the alert/webhook engine
+        (alert_checker.py via option_chain_index_spot). No-ops if this sid is
+        already a known spot underlying.
+        """
+        sid = str(security_id or "").strip()
+        ul = str(underlying or "").strip().upper()
+        if not sid or not ul or sid in self._active_spot_tokens:
+            return
+        self._active_spot_tokens[sid] = ul
+        self.subscribe_tokens([sid], exchange=exchange)
+
     def register_option_token(self, token: str, label: str = "") -> None:
         normalized = str(token or "").strip()
         if not normalized:
@@ -477,6 +551,8 @@ class _DhanTickerManager:
             )
         self._send_subscribe(new_ids, exchange)
         self.subscribed_tokens.update(new_ids)
+        for sid in new_ids:
+            self._dynamic_subscriptions[sid] = exchange
 
     # ── Chain-warming (2nd dedicated connection) ────────────────────────────────
 
@@ -595,6 +671,8 @@ class _DhanTickerManager:
         self.chain_subscribed_tokens.update(new_ids)
         self._ensure_chain_connection_started(idx)
         ws = self._chain_pool[idx].get("ws")
+        print(f"[DHAN CHAIN FEED DEBUG] warm_chain_tokens exchange={exchange} idx={idx} "
+              f"ws_set={ws is not None} new_ids_count={len(new_ids)} sample={new_ids[:3]}")
         if ws:
             self._send_chain_subscribe(ws, new_ids, exchange)
         # else: connection still coming up — _on_open subscribes everything in
@@ -885,6 +963,20 @@ class _DhanTickerManager:
             self.status = "running"
             print(f"[DHAN TICKER] connected user_id={user_id}")
             _subscribe_all(ws)
+
+            # Replay every dynamically subscribed token (option legs, stock
+            # spot underlyings) to the NEW connection. subscribed_tokens is
+            # never cleared across a reconnect, so subscribe_tokens()'s own
+            # dedup would otherwise silently skip resending these — see
+            # _dynamic_subscriptions' docstring in __init__.
+            if self._dynamic_subscriptions:
+                by_exchange: dict[str, list[str]] = {}
+                for sid, exch in self._dynamic_subscriptions.items():
+                    by_exchange.setdefault(exch, []).append(sid)
+                for exch, ids in by_exchange.items():
+                    self._send_subscribe(ids, exch)
+                print(f"[DHAN TICKER] resubscribed {len(self._dynamic_subscriptions)} "
+                      f"dynamic tokens after reconnect")
             try:
                 from features.live_event import sync_live_open_position_subscriptions
                 from features.fast_forward_event import sync_fast_forward_open_position_subscriptions
