@@ -39,6 +39,7 @@ lives under this one un-domain-prefixed path, deliberately not "/scanner" or
 
 from __future__ import annotations
 
+import asyncio
 import re
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Optional
@@ -475,7 +476,11 @@ async def chart_symbol_search(
     limit: int = Query(default=30, ge=1, le=100),
 ) -> dict[str, Any]:
     try:
-        return {"status": "success", "items": search_symbol_universe(q, limit=limit)}
+        # search_symbol_universe does blocking pymongo work (incl. an
+        # unanchored regex scan) — must run off this process's event loop,
+        # which also drives other async traffic on this service.
+        items = await asyncio.to_thread(search_symbol_universe, q, limit=limit)
+        return {"status": "success", "items": items}
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 

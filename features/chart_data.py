@@ -52,6 +52,13 @@ from features.mongo_data import MongoData
 from features.spot_atm_utils import KITE_INDEX_TOKENS
 
 STOCKS_COLLECTION = "scanner_stocks_list"
+# Every NSE cash-equity Dhan lists (see algo.simulator/api.py's
+# /algo/sync-stocks-from-dhan) — a superset of STOCKS_COLLECTION, which only
+# ever holds stocks belonging to a curated NSE index universe (nifty_50,
+# nifty_500, ...). Kept as a separate collection rather than merged into
+# STOCKS_COLLECTION so this placeholder data (symbol as company_name, no
+# industry/sector) never pollutes the scanner's own curated stock list.
+ALL_STOCKS_COLLECTION = "all_stock_list"
 
 # Dhan security IDs for indices (used when broker=dhan), verified against
 # Dhan's scrip master (https://images.dhan.co/api-data/api-scrip-master.csv), segment IDX_I.
@@ -412,7 +419,7 @@ def search_symbol_universe(query: str, limit: int = 30) -> list[dict[str, Any]]:
         for row in db[STOCKS_COLLECTION].find(
             stock_filter,
             {"_id": 0, "symbol": 1, "tradingsymbol": 1, "company_name": 1, "exchange": 1},
-        ).sort("symbol", 1).limit((limit - len(results)) * 3):
+        ).sort("symbol", 1).limit((limit - len(results)) * 3).max_time_ms(5000):
             symbol = str(row.get("symbol") or row.get("tradingsymbol") or "").strip().upper()
             if not symbol or symbol in seen_stock_symbols:
                 continue
@@ -426,6 +433,27 @@ def search_symbol_universe(query: str, limit: int = 30) -> list[dict[str, Any]]:
             })
             if len(results) >= limit:
                 break
+
+        # Fall back to the full Dhan-sourced equity list for anything not in
+        # the curated universe list above (e.g. a stock outside nifty_500/...).
+        if len(results) < limit:
+            for row in db[ALL_STOCKS_COLLECTION].find(
+                stock_filter,
+                {"_id": 0, "symbol": 1, "tradingsymbol": 1, "company_name": 1, "exchange": 1},
+            ).sort("symbol", 1).limit((limit - len(results)) * 3).max_time_ms(5000):
+                symbol = str(row.get("symbol") or row.get("tradingsymbol") or "").strip().upper()
+                if not symbol or symbol in seen_stock_symbols:
+                    continue
+                seen_stock_symbols.add(symbol)
+                results.append({
+                    "symbol": symbol,
+                    "full_name": str(row.get("company_name") or symbol),
+                    "description": symbol,
+                    "exchange": str(row.get("exchange") or "NSE"),
+                    "type": "stock",
+                })
+                if len(results) >= limit:
+                    break
 
     if len(results) < limit:
         try:
@@ -457,6 +485,7 @@ def search_symbol_universe(query: str, limit: int = 30) -> list[dict[str, Any]]:
             db["active_option_tokens"].distinct(
                 "instrument",
                 {"broker": "dhan", "option_type": "FUT", "expiry": {"$gte": today}},
+                maxTimeMS=5000,
             )
         )
         for instrument in instruments:
@@ -776,9 +805,12 @@ def get_symbol_historical_chart_bars(
     try:
         if symbol_type == "stock":
             db = MongoData()._db
-            stock = db[STOCKS_COLLECTION].find_one(
-                {"$or": [{"symbol": symbol.upper()}, {"tradingsymbol": symbol.upper()}]}
-            )
+            stock_query = {"$or": [{"symbol": symbol.upper()}, {"tradingsymbol": symbol.upper()}]}
+            stock = db[STOCKS_COLLECTION].find_one(stock_query)
+            if not stock:
+                # Not in the curated universe list — fall back to the full
+                # Dhan-sourced equity list (see ALL_STOCKS_COLLECTION above).
+                stock = db[ALL_STOCKS_COLLECTION].find_one(stock_query)
             if not stock:
                 raise ValueError(f"Unknown stock symbol={symbol}")
             if broker == "kite":

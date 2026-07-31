@@ -37,23 +37,60 @@ _DHAN_INDEX_FUTURE_CACHE: dict = {}        # {"rows": {instrument: [contract, ..
 _DHAN_COMMODITY_MASTER_CACHE: dict = {}    # {"rows": {underlying: [contract, ...]}, "date": "YYYY-MM-DD"}
 _ACTIVE_OPTION_TOKENS_INDEX_ENSURED = False
 
+_SCRIP_MASTER_MONGO_COLLECTION = "dhan_scrip_master_cache"
+_SCRIP_MASTER_MONGO_DOC_ID = "latest"
+
 
 def _get_dhan_scrip_master_rows() -> list[dict]:
     """
-    Raw Dhan scrip master CSV rows (~30MB file), downloaded once per calendar day
-    and shared by every Dhan contract sync — indices, commodities, anything else —
-    so the file is fetched at most once a day no matter how many instruments sync.
+    Raw Dhan scrip master CSV rows (~30MB file). Cached once per calendar day —
+    first in this process's own memory, then in Mongo (gzip'd) as a second tier
+    shared by every process/service, so at most one process does the actual
+    30MB Dhan HTTP fetch per day; every other process (and this one after a
+    restart) reads the Mongo copy instead of re-hitting Dhan directly.
     """
-    import io as _io, csv as _csv, requests as _req
+    import io as _io, csv as _csv
     today_str = datetime.now().strftime("%Y-%m-%d")
     if _DHAN_SCRIP_MASTER_CACHE.get("rows") and _DHAN_SCRIP_MASTER_CACHE.get("date") == today_str:
         return _DHAN_SCRIP_MASTER_CACHE["rows"]
 
+    from features.mongo_data import MongoData  # type: ignore
+    db = MongoData()
+    try:
+        doc = db._db[_SCRIP_MASTER_MONGO_COLLECTION].find_one({"_id": _SCRIP_MASTER_MONGO_DOC_ID})
+        if doc and doc.get("date") == today_str and doc.get("csv_gz"):
+            import gzip
+            csv_text = gzip.decompress(doc["csv_gz"]).decode("utf-8")
+            rows = list(_csv.DictReader(_io.StringIO(csv_text)))
+            _DHAN_SCRIP_MASTER_CACHE["rows"] = rows
+            _DHAN_SCRIP_MASTER_CACHE["date"] = today_str
+            return rows
+    except Exception:
+        log.exception("[dhan scrip master] Mongo cache read failed, falling back to a live Dhan fetch")
+    finally:
+        db.close()
+
+    import gzip, requests as _req
     resp = _req.get("https://images.dhan.co/api-data/api-scrip-master.csv", timeout=30)
     resp.raise_for_status()
-    rows = list(_csv.DictReader(_io.StringIO(resp.text)))
+    csv_text = resp.text
+    rows = list(_csv.DictReader(_io.StringIO(csv_text)))
     _DHAN_SCRIP_MASTER_CACHE["rows"] = rows
     _DHAN_SCRIP_MASTER_CACHE["date"] = today_str
+
+    try:
+        db2 = MongoData()
+        try:
+            db2._db[_SCRIP_MASTER_MONGO_COLLECTION].replace_one(
+                {"_id": _SCRIP_MASTER_MONGO_DOC_ID},
+                {"_id": _SCRIP_MASTER_MONGO_DOC_ID, "date": today_str, "csv_gz": gzip.compress(csv_text.encode("utf-8"))},
+                upsert=True,
+            )
+        finally:
+            db2.close()
+    except Exception:
+        log.exception("[dhan scrip master] failed to persist Mongo cache (non-fatal — this process's in-memory cache is still set)")
+
     return rows
 
 
@@ -259,10 +296,19 @@ def _sync_dhan_index_option_tokens(instrument: str) -> dict:
 
         created = 0
         updated = 0
+        removed = 0
         if ops:
             result = col.bulk_write(ops, ordered=False)
             created = result.upserted_count
             updated = result.matched_count
+            # Anything for this instrument/category not touched by this run's
+            # upserts (i.e. not stamped with this run's updated_at) is no
+            # longer in Dhan's scrip master — expired/delisted — drop it so
+            # stale contracts don't linger in active_option_tokens forever.
+            removed = col.delete_many({
+                "broker": "dhan", "instrument": normalized, "instrument_type": "index",
+                "updated_at": {"$ne": now_ts},
+            }).deleted_count
 
         return {
             "instrument": normalized,
@@ -270,6 +316,7 @@ def _sync_dhan_index_option_tokens(instrument: str) -> dict:
             "contracts_processed": len(contracts),
             "created": created,
             "updated": updated,
+            "removed": removed,
             "message": "active_option_tokens sync completed from Dhan scrip master",
         }
     finally:
@@ -332,10 +379,15 @@ def _sync_dhan_index_future_tokens(instrument: str) -> dict:
 
         created = 0
         updated = 0
+        removed = 0
         if ops:
             result = col.bulk_write(ops, ordered=False)
             created = result.upserted_count
             updated = result.matched_count
+            removed = col.delete_many({
+                "broker": "dhan", "instrument": normalized, "instrument_type": "future",
+                "updated_at": {"$ne": now_ts},
+            }).deleted_count
 
         return {
             "instrument": normalized,
@@ -343,6 +395,7 @@ def _sync_dhan_index_future_tokens(instrument: str) -> dict:
             "contracts_processed": len(contracts),
             "created": created,
             "updated": updated,
+            "removed": removed,
             "message": "active_option_tokens FUT sync completed from Dhan scrip master",
         }
     finally:
@@ -407,10 +460,15 @@ def _sync_dhan_commodity_tokens(instrument: str) -> dict:
 
         created = 0
         updated = 0
+        removed = 0
         if ops:
             result = col.bulk_write(ops, ordered=False)
             created = result.upserted_count
             updated = result.matched_count
+            removed = col.delete_many({
+                "broker": "dhan", "instrument": normalized, "instrument_type": "commodity",
+                "updated_at": {"$ne": now_ts},
+            }).deleted_count
 
         return {
             "instrument": normalized,
@@ -418,6 +476,7 @@ def _sync_dhan_commodity_tokens(instrument: str) -> dict:
             "contracts_processed": len(contracts),
             "created": created,
             "updated": updated,
+            "removed": removed,
             "message": "active_option_tokens sync completed from Dhan scrip master (commodity)",
         }
     finally:
@@ -453,6 +512,7 @@ def dispatch_dhan_token_sync(instrument: str) -> dict | None:
                 "contracts_processed": sum(r.get("contracts_processed", 0) for r in all_results),
                 "created": sum(r.get("created", 0) for r in all_results),
                 "updated": sum(r.get("updated", 0) for r in all_results),
+                "removed": sum(r.get("removed", 0) for r in all_results),
             },
         }
 

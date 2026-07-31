@@ -32,15 +32,30 @@ _KEY_PREFIX = "instrument_ref:"
 DEFAULT_TTL_SECONDS = 45.0
 
 _redis_client = None  # lazy, one connection per process
+_last_conn_fail_at = 0.0
+_CONN_RETRY_COOLDOWN_SECONDS = 5.0  # a down Redis shouldn't get re-dialed on every call —
+                                     # this is on the hot path (per token, per chart session,
+                                     # per heartbeat tick) and each real connect attempt costs
+                                     # real time on the caller's event loop.
 
 
 def _get_redis():
-    global _redis_client
+    global _redis_client, _last_conn_fail_at
     if _redis_client is not None:
         return _redis_client
+    now = time.time()
+    if now - _last_conn_fail_at < _CONN_RETRY_COOLDOWN_SECONDS:
+        raise ConnectionError("instrument_ref: Redis unavailable (cached failure, retry cooldown)")
     import redis
-    r = redis.Redis(host="localhost", port=6379, db=0, decode_responses=True)
-    r.ping()
+    try:
+        r = redis.Redis(
+            host="localhost", port=6379, db=0, decode_responses=True,
+            socket_connect_timeout=0.5, socket_timeout=0.5,
+        )
+        r.ping()
+    except Exception:
+        _last_conn_fail_at = now
+        raise
     _redis_client = r
     return _redis_client
 
