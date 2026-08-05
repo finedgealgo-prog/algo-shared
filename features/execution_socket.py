@@ -7443,8 +7443,17 @@ def _fetch_dhan_index_quotes(db: MongoData, underlyings: set[str]) -> dict[str, 
 # fixed cost on /simulator/positions/all (~0.7-0.9s out of ~2.5-4.4s total).
 # A short TTL absorbs that for free without ever serving metadata more than
 # a few seconds stale — same pattern as _FNO_STOCKS_CACHE/_india_vix_cache.
+#
+# 30s was still enough to show up as a top mongod CPU consumer — a full
+# ~103k-row rescan every 30s, every process, all day (see the
+# active_option_tokens missing-index/CPU investigation: mongod at 150% CPU,
+# this exact query logged every ~31s at 160-220ms). Since this collection
+# only actually changes once/day, 30s bought almost nothing over a much
+# longer TTL; bumped to 10min to match the TTL used for the same
+# reasoning elsewhere (dhan_ticker/live_monitor_socket) — still short
+# enough for a same-day corrective DB edit to land within the hour.
 _DHAN_TOKEN_MAPS_CACHE: dict[str, Any] = {}
-_DHAN_TOKEN_MAPS_CACHE_TTL = 30.0
+_DHAN_TOKEN_MAPS_CACHE_TTL = 600.0
 
 
 def _get_dhan_token_maps(raw_db) -> tuple[dict[str, dict], dict[tuple[str, str, float, str], dict]]:
