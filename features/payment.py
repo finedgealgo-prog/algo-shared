@@ -51,6 +51,56 @@ PAYMENT_ORDERS_COL = "payment_orders"
 # client behavior unchanged rather than being folded into this generic one.
 _CATALOGED_FEATURES = ("trade", "scanner", "signal", "all")
 
+# algo.terminal's own paper-trading balance collection (see that service's
+# api.py, _ensure_terminal_balance) — same shared Mongo as everything else in
+# this module, so this reads/writes it directly rather than making an HTTP
+# call to the terminal service.
+TERMINAL_BALANCES_COL = "terminal_balances"
+# Mirrors algo.terminal/api.py's TERMINAL_STARTING_CASH — kept as a literal
+# here since payment.py otherwise has zero dependency on that service.
+_TERMINAL_DEFAULT_STARTING_CASH = 10000.0
+
+
+def _apply_terminal_trade_virtual_money(user_id: str, plan_id: str) -> None:
+    """
+    Buying/granting/upgrading a Terminal Trade (Basic/Silver/Gold — see
+    PRICING_PLANS_COL below) plan tops up that user's paper-trading balance
+    to match the new plan's "Initial Virtual Money". Only the DIFFERENCE
+    from whatever Terminal Trade plan they last had gets added, not a hard
+    overwrite — so upgrading tops them up without erasing whatever P&L
+    their trading has already produced on their existing capital.
+    terminal_trade_virtual_money_inr tracks "last granted amount" so the
+    next upgrade (or downgrade) computes the correct delta again.
+    """
+    db = MongoData()._db
+    plan = db[PRICING_PLANS_COL].find_one({"plan_id": plan_id}, {"initial_virtual_money_inr": 1})
+    new_virtual_money = float((plan or {}).get("initial_virtual_money_inr") or 0)
+    if new_virtual_money <= 0:
+        return
+
+    balances = db[TERMINAL_BALANCES_COL]
+    existing = balances.find_one({"user_id": user_id})
+    previous_virtual_money = float((existing or {}).get("terminal_trade_virtual_money_inr") or 0)
+    current_available = float((existing or {}).get("available_cash") or _TERMINAL_DEFAULT_STARTING_CASH)
+    current_starting = float((existing or {}).get("starting_cash") or _TERMINAL_DEFAULT_STARTING_CASH)
+
+    delta = new_virtual_money - previous_virtual_money
+    now_str = datetime.now(timezone.utc).isoformat()
+    balances.update_one(
+        {"user_id": user_id},
+        {
+            "$set": {
+                "user_id": user_id,
+                "available_cash": round(current_available + delta, 2),
+                "starting_cash": round(current_starting + delta, 2),
+                "terminal_trade_virtual_money_inr": new_virtual_money,
+                "updated_at": now_str,
+            },
+            "$setOnInsert": {"created_at": now_str},
+        },
+        upsert=True,
+    )
+
 
 # ── Pydantic models ───────────────────────────────────────────────────────────
 
@@ -347,6 +397,8 @@ def verify_payment(payload: VerifyPaymentIn, current_user: dict = Depends(app_au
         "razorpay_order_id":   payload.razorpay_order_id,
         "razorpay_payment_id": payload.razorpay_payment_id,
     })
+    if payload.feature == "terminal_trade":
+        _apply_terminal_trade_virtual_money(user_id, plan_id)
 
     _send_purchase_notification(current_user, payload, plan_name, validity_days, expires_at)
 
@@ -471,6 +523,8 @@ def admin_grant_subscription(payload: AdminGrantIn):
         "expires_at":    expires_at,
         "reference_by":  "admin",
     })
+    if payload.feature == "terminal_trade":
+        _apply_terminal_trade_virtual_money(payload.user_id, payload.plan_id)
     return {"success": True, "id": str(result.inserted_id), "expires_at": expires_at}
 
 
@@ -577,6 +631,178 @@ def admin_delete_feature_plan(plan_id: str):
             detail=f"Cannot delete '{plan_id}' — {active_count} user(s) are currently active on this plan. Move them to another plan first.",
         )
     result = db[FEATURE_PLANS_COL].delete_one({"plan_id": plan_id})
+    if result.deleted_count == 0:
+        raise HTTPException(status_code=404, detail=f"Plan '{plan_id}' not found")
+    return {"ok": True}
+
+
+# ── Pricing plan catalogue CRUD (Basic / Silver / Gold marketing cards) ───────
+# Separate, deliberately, from FEATURE_PLANS_COL above — those are per-feature
+# (trade/scanner/signal/all-access) entitlement plans; these are the top-level
+# marketing/pricing cards (strikethrough price, discount ribbon, "Best Seller"
+# flag, ordered feature checklist) shown on the main pricing page. Same CRUD
+# shape and no-auth convention as feature-plans and Simulator's own
+# /simulator/admin/subscription-plans — public read-only list, admin-only
+# create/update/delete.
+
+PRICING_PLANS_COL = "pricing_plans"
+
+
+class PricingPlanFeatureIn(BaseModel):
+    label: str
+    included: bool = True
+
+
+class AdminPricingPlanIn(BaseModel):
+    plan_id: Optional[str] = None
+    name: str
+    original_price_inr: int = 0
+    price_inr: int = 0
+    billing_period: str = "month"
+    gst_percent: int = 18
+    badge: Optional[str] = None            # e.g. "Best Seller" — top-left flag
+    discount_badge: Optional[str] = None   # e.g. "UPTO 30% OFF" — corner ribbon
+    # Structured, not free text — these two used to only exist as manually
+    # typed lines inside `features` ("Rs. 5 Lacs - Initial Virtual Money",
+    # "Top Up - Rs. 25 for Rs. 250000 (virtual)"), which meant the displayed
+    # amount and the "real" amount could silently drift apart. The frontend
+    # now derives that checklist line's text from these fields directly.
+    initial_virtual_money_inr: int = 0
+    topup_price_inr: int = 0
+    topup_virtual_amount_inr: int = 0
+    unlimited_topups: bool = False
+    # Same reasoning as the virtual-money/topup fields above — these drive
+    # actual enforcement in algo.terminal (daily order cap + how far back
+    # order history goes), not just checklist text, so they can't stay as
+    # free-form strings either.
+    trades_per_day: int = 0
+    unlimited_trades: bool = False
+    trade_history_days: int = 0
+    features: list[PricingPlanFeatureIn] = []
+    sort_order: int = 0
+    is_active: bool = True
+
+
+_PRICING_PLAN_DEFAULTS: list[dict[str, Any]] = [
+    {
+        "plan_id": "basic", "name": "Basic", "original_price_inr": 319, "price_inr": 303,
+        "billing_period": "month", "gst_percent": 18, "badge": None, "discount_badge": "UPTO 30% OFF",
+        "initial_virtual_money_inr": 500000, "topup_price_inr": 25, "topup_virtual_amount_inr": 250000,
+        "unlimited_topups": False, "trades_per_day": 3, "unlimited_trades": False, "trade_history_days": 10,
+        "sort_order": 0, "is_active": True,
+        "features": [
+            {"label": "Stocks, Futures & Options", "included": True},
+            {"label": "Day Wise Summary", "included": True},
+            {"label": "Clear History - Rs. 1 per attempt", "included": True},
+            {"label": "Pre-Built Strategies", "included": False},
+            {"label": "Neo-Screener", "included": False},
+            {"label": "AI Based Options Trader", "included": False},
+            {"label": "Basket Orders", "included": False},
+            {"label": "Advanced Options Chain", "included": False},
+            {"label": "Options Analyzer", "included": False},
+            {"label": "Equities Screener", "included": False},
+            {"label": "Index Screener", "included": False},
+            {"label": "Industry Screener", "included": False},
+            {"label": "Sector Screener", "included": False},
+        ],
+    },
+    {
+        "plan_id": "silver", "name": "Silver", "original_price_inr": 743, "price_inr": 707,
+        "billing_period": "month", "gst_percent": 18, "badge": None, "discount_badge": "UPTO 30% OFF",
+        "initial_virtual_money_inr": 2000000, "topup_price_inr": 25, "topup_virtual_amount_inr": 250000,
+        "unlimited_topups": False, "trades_per_day": 20, "unlimited_trades": False, "trade_history_days": 30,
+        "sort_order": 1, "is_active": True,
+        "features": [
+            {"label": "Stocks, Futures & Options", "included": True},
+            {"label": "Basket Orders", "included": True},
+            {"label": "Advanced Options Chain", "included": True},
+            {"label": "Options Analyzer", "included": True},
+            {"label": "Day Wise Summary", "included": True},
+            {"label": "Clear History - Rs. 20 per attempt", "included": True},
+            {"label": "Pre-Built Strategies", "included": False},
+            {"label": "Neo-Screener", "included": False},
+            {"label": "AI Based Options Trader", "included": False},
+            {"label": "Equities Screener", "included": False},
+            {"label": "Index Screener", "included": False},
+            {"label": "Industry Screener", "included": False},
+            {"label": "Sector Screener", "included": False},
+        ],
+    },
+    {
+        "plan_id": "gold", "name": "Gold", "original_price_inr": 1215, "price_inr": 1155,
+        "billing_period": "month", "gst_percent": 18, "badge": "Best Seller", "discount_badge": "UPTO 30% OFF",
+        "initial_virtual_money_inr": 10000000, "topup_price_inr": 0, "topup_virtual_amount_inr": 0,
+        "unlimited_topups": True, "trades_per_day": 0, "unlimited_trades": True, "trade_history_days": 180,
+        "sort_order": 2, "is_active": True,
+        "features": [
+            {"label": "Stocks, Futures & Options", "included": True},
+            {"label": "Pre-Built Strategies", "included": True},
+            {"label": "Neo-Screener", "included": True},
+            {"label": "AI Based Options Trader", "included": True},
+            {"label": "Basket Orders", "included": True},
+            {"label": "Advanced Options Chain", "included": True},
+            {"label": "Options Analyzer", "included": True},
+            {"label": "Equities Screener", "included": True},
+            {"label": "Index Screener", "included": True},
+            {"label": "Industry Screener", "included": True},
+            {"label": "Sector Screener", "included": True},
+            {"label": "Day Wise Summary", "included": True},
+            {"label": "Clear History - Free", "included": True},
+        ],
+    },
+]
+
+
+def _seed_pricing_plans_if_empty() -> None:
+    col = MongoData()._db[PRICING_PLANS_COL]
+    if col.count_documents({}) == 0:
+        col.insert_many([dict(p) for p in _PRICING_PLAN_DEFAULTS])
+
+
+@payment_router.get("/pricing-plans")
+def list_pricing_plans():
+    """Public — active plans only, in card display order."""
+    _seed_pricing_plans_if_empty()
+    col = MongoData()._db[PRICING_PLANS_COL]
+    return list(col.find({"is_active": True}, {"_id": 0}).sort("sort_order", 1))
+
+
+@payment_router.get("/admin/pricing-plans")
+def admin_list_pricing_plans():
+    _seed_pricing_plans_if_empty()
+    col = MongoData()._db[PRICING_PLANS_COL]
+    return list(col.find({}, {"_id": 0}).sort("sort_order", 1))
+
+
+@payment_router.post("/admin/pricing-plans")
+def admin_create_pricing_plan(body: AdminPricingPlanIn):
+    col = MongoData()._db[PRICING_PLANS_COL]
+    raw_id = (body.plan_id or body.name).strip().lower()
+    plan_id = re.sub(r"[^a-z0-9]+", "-", raw_id).strip("-")
+    if not plan_id:
+        raise HTTPException(status_code=400, detail="plan_id or name is required")
+    if col.find_one({"plan_id": plan_id}):
+        raise HTTPException(status_code=409, detail=f"Plan '{plan_id}' already exists")
+    doc = body.dict()
+    doc["plan_id"] = plan_id
+    col.insert_one(doc)
+    return {"ok": True, "plan_id": plan_id}
+
+
+@payment_router.put("/admin/pricing-plans/{plan_id}")
+def admin_update_pricing_plan(plan_id: str, body: AdminPricingPlanIn):
+    col = MongoData()._db[PRICING_PLANS_COL]
+    doc = body.dict()
+    doc["plan_id"] = plan_id
+    result = col.update_one({"plan_id": plan_id}, {"$set": doc}, upsert=False)
+    if result.matched_count == 0:
+        raise HTTPException(status_code=404, detail=f"Plan '{plan_id}' not found")
+    return {"ok": True}
+
+
+@payment_router.delete("/admin/pricing-plans/{plan_id}")
+def admin_delete_pricing_plan(plan_id: str):
+    result = MongoData()._db[PRICING_PLANS_COL].delete_one({"plan_id": plan_id})
     if result.deleted_count == 0:
         raise HTTPException(status_code=404, detail=f"Plan '{plan_id}' not found")
     return {"ok": True}

@@ -578,6 +578,23 @@ def get_broker_rest_quotes(
                             continue
                         ltp = float(v.get("last_price") or 0)
                         oi  = int(v.get("oi") or 0)
+                        vol = int(v.get("volume") or 0)
+                        # Dhan occasionally returns a nonsensical last_price for a
+                        # contract that has zero OI and zero volume (verified against
+                        # Dhan's raw REST response directly — e.g. two completely
+                        # different far-dated SENSEX strikes both came back with the
+                        # exact same implausible last_price while their real previous
+                        # closes differed by 100x). oi==0 and volume==0 together only
+                        # happens for contracts nobody has traded/opened a position in
+                        # today — a genuine trade always bumps volume immediately and
+                        # OI same-day, so this combination is a safe "no real LTP yet"
+                        # signal, same principle the Kite path already applies (see
+                        # _fetch_full_chain_from_kite's "do NOT fall back to ohlc.close"
+                        # comment). Blindly trusting the broker's raw last_price here
+                        # was feeding garbage premiums into select_strike_live's strike
+                        # selection (e.g. PremiumRange/ClosestPremium), not just the UI.
+                        if oi <= 0 and vol <= 0:
+                            ltp = 0.0
                         tok_str = str(tok)
                         for _key in (tok_str, _numeric_to_original.get(tok_str, tok_str)):
                             existing = result.get(_key, {"ltp": 0, "oi": 0})

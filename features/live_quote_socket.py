@@ -137,6 +137,12 @@ class _LiveQuoteSession:
     # subscribed_tokens/admission-control path as the "resolve" action. ──
     attached_underlying: str | None = None
     attached_token: str | None = None
+    # ── Watchlist "track this whole basket of underlyings" (watch_instruments
+    # action) — same "UL:{instrument}" ref-key mechanism as attach_instrument
+    # above, but a full set instead of one active chart symbol, since a
+    # watchlist page has many rows visible at once. "replace" semantics: the
+    # client resends its complete current watchlist on every add/remove. ──
+    watched_underlyings: set[str] = field(default_factory=set)
 
 
 class _LiveQuoteHub:
@@ -184,6 +190,8 @@ class _LiveQuoteHub:
             _ref_release(token, "chart", session.session_id)
         if session.attached_underlying:
             _ref_release(f"UL:{session.attached_underlying}", "chart", session.session_id)
+        for instrument in session.watched_underlyings:
+            _ref_release(f"UL:{instrument}", "watchlist", session.session_id)
         if session.task and not session.task.done():
             session.task.cancel()
             try:
@@ -236,6 +244,10 @@ class _LiveQuoteHub:
 
         if action == "detach_instrument":
             await self._detach_current(session)
+            return
+
+        if action == "watch_instruments":
+            await self._handle_watch_instruments(session, payload)
             return
 
         if action == "unsubscribe":
@@ -487,6 +499,70 @@ class _LiveQuoteHub:
             _ref_release(token, "chart", session.session_id)
             session.attached_token = None
 
+    async def _handle_watch_instruments(self, session: _LiveQuoteSession, payload: dict) -> None:
+        """
+        Watchlist counterpart to attach_instrument (_handle_attach_instrument) —
+        same "UL:{instrument}" ref-key mechanism (_refresh_underlying_quotes
+        source #4), but for a whole basket of index/stock/commodity symbols at
+        once instead of one active chart symbol. "replace" semantics, same
+        shape as the "replace" tokens action: the client resends its complete
+        current watchlist on every add/remove instead of diffing client-side.
+        """
+        raw_symbols = payload.get("symbols") or []
+        kind_by_instrument: dict[str, str] = {}
+        for item in raw_symbols:
+            if not isinstance(item, dict):
+                continue
+            instrument = str(item.get("instrument") or "").strip().upper()
+            kind = str(item.get("kind") or "").strip().lower()
+            if instrument and kind in ("index", "stock", "commodity"):
+                kind_by_instrument[instrument] = kind
+
+        instruments = set(kind_by_instrument)
+        removed = session.watched_underlyings - instruments
+        added = instruments - session.watched_underlyings
+        for instrument in removed:
+            _ref_release(f"UL:{instrument}", "watchlist", session.session_id)
+        for instrument in added:
+            _ref_acquire(f"UL:{instrument}", "watchlist", session.session_id)
+        session.watched_underlyings = instruments
+
+        # Same "stocks need an explicit ask, indices already ride a permanent
+        # WS spot subscription" distinction _handle_attach_instrument makes.
+        added_stocks = [i for i in added if kind_by_instrument[i] == "stock"]
+        if added_stocks:
+            from features.dhan_ticker import ensure_stock_spot_subscribed
+            for instrument in added_stocks:
+                await asyncio.to_thread(ensure_stock_spot_subscribed, instrument)
+
+        if added:
+            await self._prime_underlying_quotes(added)
+
+    async def _prime_underlying_quotes(self, instruments: set[str]) -> None:
+        """
+        A newly-watched instrument would otherwise sit at whatever's already
+        in _underlying_quote_cache (nothing, for a symbol nobody was tracking
+        before) until _refresh_underlying_quotes' next scheduled pass — up to
+        REST_REFRESH_INTERVAL_SECONDS away, plus the wait was for real since
+        that loop fetches by REST regardless of whether a WS tick has landed.
+        Fetching just these newly-added instruments right now and dropping
+        the result straight into the same cache means the very next
+        _emit_loop tick (EMIT_INTERVAL_SECONDS away, not REST_REFRESH_
+        INTERVAL_SECONDS) already has something to broadcast — this is what
+        turns "add to watchlist" into a sub-second LTP instead of a multi-
+        second wait for the shared background loop to get around to it.
+        """
+        from features.mongo_data import MongoData
+        from features.execution_socket import _fetch_dhan_index_quotes
+
+        db = MongoData()
+        try:
+            quotes = await asyncio.to_thread(_fetch_dhan_index_quotes, db, instruments)
+        finally:
+            db.close()
+        if quotes:
+            self._underlying_quote_cache.update(quotes)
+
     async def _handle_auth(self, session: _LiveQuoteSession, payload: dict) -> None:
         """
         Opt-in identity for the MTM broadcast — every other action above works
@@ -670,7 +746,7 @@ class _LiveQuoteHub:
     async def _emit_loop(self, session: _LiveQuoteSession) -> None:
         try:
             while not session.closed:
-                if session.subscribed_tokens or session.attached_underlying:
+                if session.subscribed_tokens or session.attached_underlying or session.watched_underlyings:
                     now_monotonic = time.monotonic()
                     if now_monotonic - session.last_ref_heartbeat >= REF_HEARTBEAT_INTERVAL_SECONDS:
                         session.last_ref_heartbeat = now_monotonic
@@ -678,6 +754,8 @@ class _LiveQuoteHub:
                             _ref_acquire(token, "chart", session.session_id)
                         if session.attached_underlying:
                             _ref_acquire(f"UL:{session.attached_underlying}", "chart", session.session_id)
+                        for instrument in session.watched_underlyings:
+                            _ref_acquire(f"UL:{instrument}", "watchlist", session.session_id)
                 if session.subscribed_tokens:
                     changed = self._collect_changed_ltp(session)
                     if changed:

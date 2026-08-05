@@ -7498,10 +7498,11 @@ def _fetch_dhan_broker_option_positions(
     Fetch live option positions normalized to the update-socket open_positions
     shape used by the simulator frontend.
 
-    Positions/orders are per-broker (Dhan here via kite_market_config,
-    FlatTrade via broker_configuration — see the flattrade block below), but
-    LTP/spot is always resolved through Dhan's own feed (active_option_tokens
-    + dhan_ticker_manager/REST quotes) regardless of which broker actually
+    Positions/orders are per-broker — Dhan, FlatTrade, and Kite are all
+    broker_configuration accounts (see _list_dhan_docs/_list_broker_docs and
+    _account_login_state below), one or more per broker — but LTP/spot is
+    always resolved through Dhan's own feed (active_option_tokens +
+    dhan_ticker_manager/REST quotes) regardless of which broker actually
     holds the leg. Same split AlgoTest/Sensibull use: trade execution stays
     broker-native, market data is centralized on one feed.
     """
@@ -7509,6 +7510,7 @@ def _fetch_dhan_broker_option_positions(
         broker_refresh_user_tokens as _broker_refresh_user_tokens,
         get_broker_rest_quotes as _get_broker_rest_quotes,
     )
+    from features.dhan_broker import _is_dhan_doc
     import time as _prof_time
     _prof_t0 = _prof_time.perf_counter()
     def _prof(label: str) -> None:
@@ -7524,33 +7526,9 @@ def _fetch_dhan_broker_option_positions(
     # them.
     fetch_positions = not include_broker_status
 
-    # ── Dhan: positions fetched directly via kite_market_config ──
-    # Resolved from Dhan's own doc only — never gated by _active_broker()/the
-    # "enabled" toggle, which is a separate single-active-broker concept for
-    # market-data/WS routing (e.g. which ticker singleton starts), not for
-    # whether this user can view a given broker's positions here. Logging
-    # into one broker must never block reading another's (same reasoning as
-    # the FlatTrade/Kite branches below, which were never gated this way).
     raw_positions: list[dict] = []
     dhan_detail = ''
-    cfg = raw_db['kite_market_config'].find_one({'broker': 'dhan'}) or {}
-    dhan_broker_id = str(cfg.get('_id') or '').strip()
-    if normalized_selected_broker_id and normalized_selected_broker_id == dhan_broker_id:
-        selected_broker_kind = 'dhan'
-    dhan_access_token = str(cfg.get('access_token') or '').strip()
-    dhan_client_id = str(cfg.get('user_id') or cfg.get('dhan_client_id') or '').strip()
-    dhan_logged_in = bool(dhan_access_token and dhan_client_id)
-    if not dhan_logged_in:
-        dhan_detail = 'Dhan credentials not configured'
-    elif include_broker_status:
-        # Stored-credential presence can't tell a stale token from a live one
-        # — only worth the extra API ping here, on the low-frequency
-        # broker-status badge call, never on the position-poll hot path below
-        # (where the positions fetch itself already proves the session).
-        from features.dhan_broker_ws import validate_access_token as _validate_dhan_token
-        if not _validate_dhan_token(dhan_access_token):
-            dhan_logged_in = False
-            dhan_detail = 'Dhan session expired. Please login again.'
+    dhan_account_doc_id = ''
 
     # Reverse index so a FlatTrade leg (which has no Dhan token of its own)
     # can be matched to Dhan's token for the same contract — the join key the
@@ -7560,14 +7538,19 @@ def _fetch_dhan_broker_option_positions(
     token_map, dhan_token_by_contract = _get_dhan_token_maps(raw_db)
     _prof("after _get_dhan_token_maps")
 
-    # ── FlatTrade / Kite: account docs only (mongo) ──
+    # ── Dhan / FlatTrade / Kite: account docs only (mongo) ──
     # broker_configuration has no persisted "enabled"/"is_logged_in" flag for
-    # these two — historically the only way to know was a live API ping
-    # (kite.profile() / FlatTrade session validate), which is as slow as
-    # fetching positions itself. So, same as Dhan above, treat stored
-    # credential presence as "logged in" here too; the real proof of a still-
-    # valid session is the positions fetch below (already wrapped in
+    # any of these three — historically the only way to know was a live API
+    # ping (kite.profile() / FlatTrade session validate / Dhan token
+    # validate), which is as slow as fetching positions itself. So treat
+    # stored credential presence as "logged in" here; the real proof of a
+    # still-valid session is the positions fetch below (already wrapped in
     # try/except), which only runs for the one broker actually being used.
+    # Never gated by _active_broker()/the "enabled" toggle, which is a
+    # separate single-active-broker concept for market-data/WS routing (e.g.
+    # which ticker singleton starts), not for whether this user can view a
+    # given broker's positions here — logging into one broker must never
+    # block reading another's.
     from features.flattrade_broker import get_flattrade_instance, parse_flattrade_tsym
     from features.kite_broker_ws import parse_kite_tradingsymbol
 
@@ -7593,43 +7576,82 @@ def _fetch_dhan_broker_option_positions(
                 docs.append(doc)
         return docs
 
+    def _list_dhan_docs() -> list[dict]:
+        # Same broker_configuration/broker_type:'live' (+ optional single _id)
+        # query shape as _list_broker_docs above, but Dhan accounts are
+        # identified the same way order placement/order-updates already do
+        # (_is_dhan_doc — a name/broker_icon substring check) rather than a
+        # broker_name keyword, since a Dhan account's own label rarely
+        # contains the literal word "dhan".
+        query: dict[str, Any] = {'broker_type': 'live'}
+        if normalized_selected_broker_id:
+            try:
+                query['_id'] = ObjectId(normalized_selected_broker_id)
+            except Exception:
+                return []
+        return [doc for doc in raw_db['broker_configuration'].find(query) if _is_dhan_doc(doc)]
+
     def _account_login_state(doc: dict, verify_live: bool = False) -> dict:
         broker_doc_id = str(doc.get('_id') or '').strip()
         broker_name = str(doc.get('broker_name') or doc.get('name') or '').strip()
         access_token = str(doc.get('access_token') or '').strip()
         api_key = str(doc.get('api_key') or '').strip()
         is_kite = 'zerodha' in broker_name.lower() or 'kite' in broker_name.lower()
-        has_credentials = bool(access_token) and (bool(api_key) if is_kite else True)
+        is_dhan = _is_dhan_doc(doc)
+
+        if is_dhan:
+            # Dhan has no api_key concept — access-token + client-id (the
+            # account's own broker_user_id, falling back to user_id) is
+            # enough, same pair _simulator_place_manual_order_core already
+            # reads off a Dhan broker_configuration doc for order placement.
+            account_id = str(doc.get('broker_user_id') or doc.get('user_id') or '').strip()
+            has_credentials = bool(access_token) and bool(account_id)
+        else:
+            account_id = str(doc.get('user_id') or '').strip()
+            has_credentials = bool(access_token) and (bool(api_key) if is_kite else True)
 
         is_logged_in = has_credentials
-        message = '' if has_credentials else 'Credentials not configured'
+        message = '' if has_credentials else ('Dhan credentials not configured' if is_dhan else 'Credentials not configured')
         if has_credentials and verify_live:
-            # Stored-token presence can't tell a stale Kite/FlatTrade token
-            # from a live one — both expire silently server-side with no DB
-            # write, so only a real API ping (kite.profile() / FlatTrade
-            # OrderBook, via the same check /broker-configurations already
-            # runs) tells the truth. Only paid for here, on the
-            # low-frequency broker-status badge call — never on the
-            # position-poll hot path, where the positions fetch itself is
-            # already a live proof of the session.
-            from features.broker_accounts import validate_broker_configuration_session
-            is_logged_in, _expired, validate_message = validate_broker_configuration_session(doc, raw_db)
-            if not is_logged_in:
-                message = validate_message or 'Session expired. Please login again.'
+            # Stored-token presence can't tell a stale token from a live one —
+            # every one of these three brokers expires silently server-side
+            # with no DB write, so only a real API ping (kite.profile() /
+            # FlatTrade OrderBook / Dhan token validate) tells the truth. Only
+            # paid for here, on the low-frequency broker-status badge call —
+            # never on the position-poll hot path, where the positions fetch
+            # itself is already a live proof of the session.
+            if is_dhan:
+                from features.dhan_broker_ws import validate_access_token as _validate_dhan_token
+                if not _validate_dhan_token(access_token):
+                    is_logged_in = False
+                    message = 'Dhan session expired. Please login again.'
+            else:
+                from features.broker_accounts import validate_broker_configuration_session
+                is_logged_in, _expired, validate_message = validate_broker_configuration_session(doc, raw_db)
+                if not is_logged_in:
+                    message = validate_message or 'Session expired. Please login again.'
 
         return {
             '_id': broker_doc_id,
-            'broker_name': broker_name,
-            'broker_icon': str(doc.get('broker_icon') or '').strip(),
-            'account_id': str(doc.get('user_id') or '').strip(),
+            'broker_name': broker_name or ('Dhan' if is_dhan else ''),
+            'broker_icon': str(doc.get('broker_icon') or ('dhan.svg' if is_dhan else '')).strip(),
+            'account_id': account_id,
             'user_name': str(doc.get('user_name') or '').strip(),
             'api_key': api_key,
             'access_token': access_token,
             'is_logged_in': is_logged_in,
-            'login_url': '' if is_logged_in else _broker_login_url(broker_name, broker_doc_id),
+            # Dhan has no in-app OAuth/login-redirect flow of its own yet — an
+            # expired Dhan session has nowhere to send the user, unlike
+            # FlatTrade/Kite's broker/*/login routes.
+            'login_url': '' if (is_logged_in or is_dhan) else _broker_login_url(broker_name, broker_doc_id),
             'message': message,
         }
 
+    try:
+        dhan_docs = _list_dhan_docs()
+    except Exception as exc:
+        dhan_docs = []
+        log.debug('dhan account lookup error: %s', exc)
     try:
         flattrade_docs = _list_broker_docs(('flattrade',))
     except Exception as exc:
@@ -7641,6 +7663,9 @@ def _fetch_dhan_broker_option_positions(
         kite_docs = []
         log.debug('kite account lookup error: %s', exc)
 
+    for doc in dhan_docs:
+        if normalized_selected_broker_id and normalized_selected_broker_id == str(doc.get('_id') or '').strip():
+            selected_broker_kind = 'dhan'
     for doc in flattrade_docs:
         if normalized_selected_broker_id and normalized_selected_broker_id == str(doc.get('_id') or '').strip():
             selected_broker_kind = 'flattrade'
@@ -7653,12 +7678,14 @@ def _fetch_dhan_broker_option_positions(
     # Otherwise (the "All Brokers" view) only the first logged-in broker in
     # dropdown order — Dhan, then FlatTrade, then Kite — is used, instead of
     # merging all three brokers' positions on every load.
+    dhan_accounts: list[dict] = []
     flattrade_accounts: list[dict] = []
     kite_accounts: list[dict] = []
     target_kind = selected_broker_kind
 
     if fetch_positions and not normalized_selected_broker_id:
-        if dhan_logged_in:
+        dhan_accounts = [_account_login_state(doc) for doc in dhan_docs]
+        if any(account['is_logged_in'] for account in dhan_accounts):
             target_kind = 'dhan'
         else:
             flattrade_accounts = [_account_login_state(doc) for doc in flattrade_docs]
@@ -7672,20 +7699,23 @@ def _fetch_dhan_broker_option_positions(
     if include_broker_status:
         # Dropdown badges need every broker's login state regardless of which
         # one (if any) ends up supplying position data above.
+        if not dhan_accounts:
+            dhan_accounts = [_account_login_state(doc, verify_live=True) for doc in dhan_docs]
         if not flattrade_accounts:
             flattrade_accounts = [_account_login_state(doc, verify_live=True) for doc in flattrade_docs]
         if not kite_accounts:
             kite_accounts = [_account_login_state(doc, verify_live=True) for doc in kite_docs]
-        broker_status.append({
-            'broker_id': dhan_broker_id,
-            'broker_name': 'dhan',
-            'broker_key': 'dhan',
-            'broker_icon': 'dhan.svg',
-            'user_name': str(cfg.get('user_name') or '').strip(),
-            'is_logged_in': dhan_logged_in,
-            'login_url': '',
-            'message': dhan_detail,
-        })
+        for account in dhan_accounts:
+            broker_status.append({
+                'broker_id': account['_id'],
+                'broker_name': account.get('broker_name') or 'Dhan',
+                'broker_key': 'dhan',
+                'broker_icon': account.get('broker_icon') or 'dhan.svg',
+                'user_name': account.get('user_name') or '',
+                'is_logged_in': bool(account.get('is_logged_in')),
+                'login_url': account.get('login_url') or '',
+                'message': account.get('message') or '',
+            })
         for account in flattrade_accounts:
             broker_status.append({
                 'broker_id': account['_id'],
@@ -7709,37 +7739,53 @@ def _fetch_dhan_broker_option_positions(
                 'message': account.get('message') or '',
             })
 
-    _prof(f"before dhan /v2/positions (target_kind={target_kind} dhan_logged_in={dhan_logged_in})")
-    if target_kind == 'dhan' and dhan_logged_in:
-        try:
-            import requests as _req  # type: ignore
+    _prof(f"before dhan /v2/positions (target_kind={target_kind})")
+    if target_kind == 'dhan':
+        if not dhan_accounts:
+            dhan_accounts = [_account_login_state(doc) for doc in dhan_docs]
+        for account in dhan_accounts:
+            if not account.get('is_logged_in'):
+                # Reached when a specific broker_id was requested directly
+                # (e.g. the Positions page's by-broker dropdown) and that
+                # account has no/missing credentials — surface why instead of
+                # silently returning zero positions.
+                dhan_detail = account.get('message') or 'Dhan not logged in'
+                continue
+            dhan_access_token = str(account.get('access_token') or '').strip()
+            dhan_client_id = str(account.get('account_id') or '').strip()
+            dhan_account_doc_id = str(account.get('_id') or '').strip()
+            try:
+                import requests as _req  # type: ignore
 
-            response = _req.get(
-                'https://api.dhan.co/v2/positions',
-                headers={
-                    'access-token': dhan_access_token,
-                    'client-id': dhan_client_id,
-                    'Content-Type': 'application/json',
-                    'Accept': 'application/json',
-                },
-                timeout=8,
-            )
-            _prof("after dhan /v2/positions HTTP call")
-            payload = response.json() if response.ok else {}
-            # Debug: raw Dhan /v2/positions response, untouched by our entry_price/exit_price
-            # normalization below — compare this against Dhan's own UI numbers when they drift.
-            print(f"[DHAN RAW /v2/positions] broker_id={dhan_broker_id} status={response.status_code} payload_len={len(str(payload))}")
-            _prof("after dhan /v2/positions payload parse+print")
-            if isinstance(payload, list):
-                raw_positions = payload
-            elif isinstance(payload, dict):
-                for key in ('data', 'positions', 'open_positions', 'result'):
-                    candidate = payload.get(key)
-                    if isinstance(candidate, list):
-                        raw_positions = candidate
-                        break
-        except Exception as exc:
-            dhan_detail = f'Failed to fetch dhan positions: {exc}'
+                response = _req.get(
+                    'https://api.dhan.co/v2/positions',
+                    headers={
+                        'access-token': dhan_access_token,
+                        'client-id': dhan_client_id,
+                        'Content-Type': 'application/json',
+                        'Accept': 'application/json',
+                    },
+                    timeout=8,
+                )
+                _prof("after dhan /v2/positions HTTP call")
+                payload = response.json() if response.ok else {}
+                # Debug: raw Dhan /v2/positions response, untouched by our entry_price/exit_price
+                # normalization below — compare this against Dhan's own UI numbers when they drift.
+                print(f"[DHAN RAW /v2/positions] broker_id={dhan_account_doc_id} status={response.status_code} payload_len={len(str(payload))}")
+                _prof("after dhan /v2/positions payload parse+print")
+                if isinstance(payload, list):
+                    raw_positions = payload
+                elif isinstance(payload, dict):
+                    for key in ('data', 'positions', 'open_positions', 'result'):
+                        candidate = payload.get(key)
+                        if isinstance(candidate, list):
+                            raw_positions = candidate
+                            break
+                dhan_detail = ''  # this account's fetch succeeded
+            except Exception as exc:
+                dhan_detail = f'Failed to fetch dhan positions: {exc}'
+                continue
+            break  # only the first logged-in Dhan account in dropdown order
 
     flattrade_detail = ''
     flattrade_raw_legs: list[dict] = []
@@ -8186,7 +8232,7 @@ def _fetch_dhan_broker_option_positions(
             'strategy_id': f'dhan-broker:{underlying or "UNKNOWN"}',
             'strategy_name': f'Dhan Live Positions - {underlying}'.strip(' -') if underlying else 'Dhan Live Positions',
             'group_name': 'Broker',
-            'broker_id': dhan_broker_id,
+            'broker_id': dhan_account_doc_id,
             'broker_key': 'dhan',
             'ticker': underlying,
             'underlying': underlying,

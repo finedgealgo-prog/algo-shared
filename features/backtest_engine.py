@@ -9,7 +9,9 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta
 from typing import Optional, Tuple
-from collections import defaultdict
+
+import numpy as np
+import polars as pl
 
 try:
     from .mongo_data        import MongoData
@@ -17,6 +19,7 @@ try:
     from .expiry_config     import get_expiry_weekday_from_rules
     from .range_breakout    import (
         parse_range_breakout,
+        parse_leg_range_breakout,
         compute_range,
         compute_btst_range,
         compute_positional_range,
@@ -47,6 +50,7 @@ except ImportError:
     from expiry_config     import get_expiry_weekday_from_rules
     from range_breakout    import (
         parse_range_breakout,
+        parse_leg_range_breakout,
         compute_range,
         compute_btst_range,
         compute_positional_range,
@@ -93,84 +97,89 @@ RETURN_COMBINED_MTM_BREAKDOWN = True
 RETURN_PNL_SUMMARY = False
 RETURN_MINUTE_PNL = False
 RETURN_TRADE_EXPLANATION = False
+# TEMP: off while multi-strategy x multi-year portfolio backtests are being
+# sized up (30 strategies x 5 years was projected at ~200MB with this on) —
+# flip back to True once large-scale responses have a non-inline delivery
+# path (e.g. external file + link, like the AlgoTest reference response).
+RETURN_TRADE_EXPLANATION_CONTENT = False
 
 
 # ─── In-Memory Index ──────────────────────────────────────────────────────────
 
 class DataIndex:
     """
-    Built once from bulk-loaded candles.
-    All lookups are O(1) dict access — no DB calls during backtest.
+    Built once from one trading day's bulk-loaded candles (one DataIndex = one day —
+    see _load_index_cached, which is always called per specific date).
 
-    candle_index  : (date, time, expiry, strike, type)  → close price
-    spot_index    : (date, time)                         → spot price
-    expiry_index  : date                                 → sorted list of expiries
-    time_index    : (date, expiry, strike, type)         → sorted list of "HH:MM" strings
+    Storage is array-based, grouped by (time, expiry, type) — NOT one dict entry per
+    row. A day's option chain has ~127k rows but only ~6k distinct (time, expiry, type)
+    groups; within a group, strikes are sorted and looked up via np.searchsorted into
+    a shared numpy array slice. This mirrors shared/fast_backtest/day_chain.py's
+    approach and is what makes cold builds ~80ms/day instead of ~550ms/day (building
+    ~127k individual dict entries was the bottleneck — see _build_data_index).
+
+    expiry_index      : date                              → sorted list of expiries
+    _time_map_offsets : (expiry, strike, type)            → (start, end) into _time_map_minutes
+    _time_map_minutes : flat int16 array, minutes-since-midnight, sorted per group
+    spot_index        : (date, time)                      → spot price
+
+    Strikes for a (time, expiry, type) group come straight from _groups + _strike
+    (already sorted ascending — see get_strikes) rather than a separate index, since
+    that's exactly what _groups already slices out.
     """
 
-    def __init__(self, raw_candles: list):
-        self.candle_index:  dict = {}
-        self.high_index:    dict = {}
-        self.low_index:     dict = {}
-        self.spot_index:    dict = {}
-        self.delta_index:   dict = {}
-        self.expiry_index:  dict = defaultdict(set)
-        self._time_map:     dict = defaultdict(list)
-        self._all_times:    dict = defaultdict(set)
-        self.strikes_index: dict = defaultdict(set)
-
-        c_i = self.candle_index
-        h_i = self.high_index
-        l_i = self.low_index
-        s_i = self.spot_index
-        d_i = self.delta_index
-        e_i = self.expiry_index
-        t_m = self._time_map
-        a_t = self._all_times
-        st_i = self.strikes_index
-
-        for c in raw_candles:
-            try:
-                ts = c["timestamp"]
-                date_str = ts[:10]
-                time_str = ts[11:16]
-
-                expiry = c["expiry"]
-                strike = int(c["strike"])
-                otype  = c["type"]
-                close  = float(c["close"])
-                spot   = float(c.get("spot_price", 0))
-                high   = float(c.get("high", close))
-                low    = float(c.get("low",  close))
-                delta  = c.get("delta")
-
-                key = (date_str, time_str, expiry, strike, otype)
-
-                c_i[key] = close
-                h_i[key] = high
-                l_i[key] = low
-                s_i[(date_str, time_str)] = spot
-                if delta is not None:
-                    d_i[key] = float(delta)
-                e_i[date_str].add(expiry)
-                t_m[(date_str, expiry, strike, otype)].append(time_str)
-                a_t[date_str].add(time_str)
-                st_i[(date_str, time_str, expiry, otype)].add(strike)
-            except KeyError:
-                pass
-
-        self.expiry_index  = {d: sorted(v) for d, v in self.expiry_index.items()}
-        self._time_map     = {k: sorted(set(v)) for k, v in self._time_map.items()}
-        self._all_times    = {d: sorted(v)      for d, v in self._all_times.items()}
-        self.strikes_index = {k: sorted(v)      for k, v in self.strikes_index.items()}
+    def get_strikes(self, date: str, time: str, expiry: str, otype: str) -> np.ndarray:
+        if date != self.date:
+            return self._strike[:0]
+        bounds = self._groups.get((time, expiry, otype))
+        if bounds is None:
+            return self._strike[:0]
+        start, end = bounds
+        return self._strike[start:end]  # already sorted ascending (df sort in _build_data_index)
 
     def get_close(self, date: str, time: str, expiry: str,
                   strike: int, otype: str) -> Optional[float]:
-        return self.candle_index.get((date, time, expiry, strike, otype))
+        if date != self.date:
+            return None
+        bounds = self._groups.get((time, expiry, otype))
+        if bounds is None:
+            return None
+        start, end = bounds
+        strikes = self._strike[start:end]
+        pos = int(np.searchsorted(strikes, strike))
+        if pos >= len(strikes) or strikes[pos] != strike:
+            return None
+        return float(self._close[start + pos])
 
     def get_delta(self, date: str, time: str, expiry: str,
                   strike: int, otype: str) -> Optional[float]:
-        return self.delta_index.get((date, time, expiry, strike, otype))
+        if date != self.date:
+            return None
+        bounds = self._groups.get((time, expiry, otype))
+        if bounds is None:
+            return None
+        start, end = bounds
+        strikes = self._strike[start:end]
+        pos = int(np.searchsorted(strikes, strike))
+        if pos >= len(strikes) or strikes[pos] != strike:
+            return None
+        delta = float(self._delta[start + pos])
+        return None if np.isnan(delta) else delta
+
+    def _get_high_low(self, date: str, time: str, expiry: str,
+                       strike: int, otype: str) -> Optional[Tuple[float, float]]:
+        if date != self.date:
+            return None
+        bounds = self._groups.get((time, expiry, otype))
+        if bounds is None:
+            return None
+        start, end = bounds
+        strikes = self._strike[start:end]
+        pos = int(np.searchsorted(strikes, strike))
+        if pos >= len(strikes) or strikes[pos] != strike:
+            return None
+        i = start + pos
+        return float(self._high[i]), float(self._low[i])
 
     def get_spot(self, date: str, time: str) -> Optional[float]:
         return self.spot_index.get((date, time))
@@ -180,17 +189,26 @@ class DataIndex:
 
     def get_candles_range(self, date: str, start_time: str, end_time: str,
                           expiry: str, strike: int, otype: str) -> list:
-        times = self._time_map.get((date, expiry, strike, otype), [])
+        if date != self.date:
+            return []
+        bounds = self._time_map_offsets.get((expiry, strike, otype))
+        if bounds is None:
+            return []
+        start_idx, end_idx = bounds
+        minutes = self._time_map_minutes[start_idx:end_idx]
+        start_m = int(start_time[:2]) * 60 + int(start_time[3:5])
+        end_m   = int(end_time[:2]) * 60 + int(end_time[3:5])
         result = []
-        for t in times:
-            if start_time <= t <= end_time:
-                key = (date, t, expiry, strike, otype)
-                result.append({
-                    "time":  t,
-                    "close": self.candle_index[key],
-                    "high":  self.high_index.get(key, self.candle_index[key]),
-                    "low":   self.low_index.get(key,  self.candle_index[key]),
-                })
+        for m in minutes:
+            m = int(m)
+            if start_m <= m <= end_m:
+                t = f"{m // 60:02d}:{m % 60:02d}"
+                close = self.get_close(date, t, expiry, strike, otype)
+                if close is None:
+                    continue
+                hl = self._get_high_low(date, t, expiry, strike, otype)
+                high, low = hl if hl is not None else (close, close)
+                result.append({"time": t, "close": close, "high": high, "low": low})
         return result
 
 
@@ -258,8 +276,8 @@ def _resolve_strike_by_premium(
     Scans all available strikes at the given time and returns
     the strike whose current premium is closest to target_premium.
     """
-    strikes = idx.strikes_index.get((day, time_str, expiry, otype), [])
-    if not strikes:
+    strikes = idx.get_strikes(day, time_str, expiry, otype)
+    if strikes.size == 0:
         return None
 
     best_strike = None
@@ -271,7 +289,7 @@ def _resolve_strike_by_premium(
         diff = abs(price - target_premium)
         if diff < best_diff:
             best_diff   = diff
-            best_strike = s
+            best_strike = int(s)  # s is a numpy scalar from idx.get_strikes() — not JSON serializable as-is
     return best_strike
 
 
@@ -286,8 +304,8 @@ def _resolve_strike_by_delta(
     whose absolute delta is closest to target_delta.
     Falls back to ATM when no delta data is available (e.g. older data).
     """
-    strikes = idx.strikes_index.get((day, time_str, expiry, otype), [])
-    if not strikes:
+    strikes = idx.get_strikes(day, time_str, expiry, otype)
+    if strikes.size == 0:
         return None
 
     best_strike = None
@@ -302,7 +320,7 @@ def _resolve_strike_by_delta(
         diff = abs(abs(delta) - target_delta)
         if diff < best_diff:
             best_diff   = diff
-            best_strike = s
+            best_strike = int(s)  # s is a numpy scalar from idx.get_strikes() — not JSON serializable as-is
 
     return best_strike if has_delta else None
 
@@ -666,13 +684,37 @@ def _process_leg(idx, day, entry_time, exit_time,
                  trail_type: str = "None", trail_x: float = 0.0,
                  trail_y: float = 0.0,
                  reentry_sl_next_ref: str = None,
-                 reentry_tp_next_ref: str = None) -> dict:
+                 reentry_tp_next_ref: str = None,
+                 next_idx=None, next_day: str = None, next_exit_time: str = None,
+                 skip_stale_entry: bool = False) -> dict:
     """
     Process a single leg with re-entry support.
 
     ReentryType.Immediate        → same position, new ATM strike
     ReentryType.ImmediateReverse → flip position (BUY↔SELL), new ATM strike
     Both: same option type (CE stays CE), instant re-entry at exit time
+
+    next_idx/next_day/next_exit_time (all None by default — zero behavior
+    change for every existing non-BTST caller): whole-strategy BTST support.
+    When provided, a sub-trade whose SL/Target/Time-exit doesn't resolve
+    within Day 1's own candles (scanned up to "23:59", i.e. to the end of
+    Day 1's actual data) rolls into Day 2 — `cur_idx`/`cur_day` switch to
+    `next_idx`/`next_day` and stay there for the rest of this leg's
+    lifetime (reentries included) — there is no Day 3, matching BTST's
+    definition as a 2-day window. `exit_time` remains the final overall
+    cutoff (Day 2's clock time when BTST, same-day otherwise).
+
+    skip_stale_entry: only ever True for a signal-driven window on a plain
+    intraday, non-BTST strategy (see the caller — it passes
+    `is_signal_driven and not is_positional and not is_whole_strategy_btst`;
+    every other caller, including every existing non-signal-driven backtest,
+    always passes False here, so their behavior is untouched). When True and
+    the leg's own entry_time has already reached exit_time — e.g. a
+    signal-driven window whose entry landed after the strategy's exit
+    cutoff (a mismatched Signal Chart pairing) — the leg is skipped outright,
+    no trade logged, since there is no window left to hold a same-day
+    position in. When False, the old behavior is kept (enter and flat-exit
+    at the same candle for a zero-PnL "Time Exit" row).
     """
     sub_trades            = []
     sl_left               = reentry_sl_count
@@ -688,8 +730,30 @@ def _process_leg(idx, day, entry_time, exit_time,
     # listen_time = when momentum base price is measured (shifts to exit_at after each trade)
     listen_time   = strategy_entry_time or entry_time
 
+    # Mutated on BTST day-rollover (Day 1 -> Day 2) and then held for the
+    # rest of the function — every idx/day reference below uses these, not
+    # the fixed `idx`/`day` params, so a reentry that happens after rollover
+    # is correctly priced against Day 2. For non-BTST calls (next_idx=None)
+    # these never change, so behavior is byte-identical to before.
+    cur_idx = idx
+    cur_day = day
+
     while True:
         is_first = len(sub_trades) == 0
+
+        # Signal-driven leg with no window left to trade in (entry_time
+        # already at/after exit_time — a mismatched Signal Chart pairing):
+        # skip the leg outright instead of falling through to the
+        # enter-and-flat-exit-at-the-same-candle fallback below, which used
+        # to log a confusing zero-PnL "Initial ... Time Exit" trade for a
+        # position that was never actually open. Only the very first
+        # attempt is gated here — a reentry landing past exit_time is
+        # already refused separately (see `exit_at <= exit_time` in the
+        # re-entry decision below). skip_stale_entry is False for every
+        # non-signal-driven caller, so the plain fixed-time backtest flow
+        # never reaches this branch at all.
+        if is_first and skip_stale_entry and cur_time >= exit_time:
+            break
 
         # AtCost re-entry: use the original cost price, not the candle close
         if forced_entry_price is not None:
@@ -699,15 +763,20 @@ def _process_leg(idx, day, entry_time, exit_time,
             # Momentum / ORB breakout: use limit-order execution price for first trade
             entry_price = override_entry_px
         else:
-            entry_price = idx.get_close(day, cur_time, expiry, cur_strike, otype)
+            entry_price = cur_idx.get_close(cur_day, cur_time, expiry, cur_strike, otype)
         if entry_price is None:
             break
-        actual_entry_market_price = idx.get_close(day, cur_time, expiry, cur_strike, otype)
+        actual_entry_market_price = cur_idx.get_close(cur_day, cur_time, expiry, cur_strike, otype)
         if actual_entry_market_price is None:
             actual_entry_market_price = entry_price
 
         # Spot at entry — needed for Underlying SL/Target calculation
-        entry_spot = idx.get_spot(day, cur_time) or 0.0
+        entry_spot = cur_idx.get_spot(cur_day, cur_time) or 0.0
+        # Captured before the scan/rollover block below can mutate cur_idx/
+        # cur_day — this sub-trade's true entry day (+ its index), independent
+        # of where it exits.
+        entry_day = cur_day
+        entry_idx = cur_idx
 
         # Pre-compute SL / Target trigger levels for display
         sl_display  = _calc_trigger_price(entry_price, entry_spot, cur_position,
@@ -720,7 +789,7 @@ def _process_leg(idx, day, entry_time, exit_time,
             if is_first and override_base_px is not None:
                 base_px = override_base_px   # pre-computed in run_backtest
             else:
-                base_px = idx.get_close(day, listen_time, expiry, cur_strike, otype)
+                base_px = cur_idx.get_close(cur_day, listen_time, expiry, cur_strike, otype)
             if base_px is not None:
                 sub_base_price   = round(base_px, 2)
                 sub_target_price = round(_calc_momentum_target(base_px, momentum_type, momentum_val), 2)
@@ -730,27 +799,57 @@ def _process_leg(idx, day, entry_time, exit_time,
             sub_base_price = sub_target_price = None
 
         scan_start = _add_one_minute(cur_time)
+        # Day 1's own scan window ends at end-of-data ("23:59") when a Day-2
+        # rollover is available and we're still on Day 1 — the real overall
+        # cutoff (`exit_time`) only applies once we're scanning Day 2 (or for
+        # every non-BTST call, where this is simply `exit_time` as before).
+        scan_end = "23:59" if (next_idx is not None and cur_day == day) else exit_time
 
-        if scan_start > exit_time:
-            exit_price  = entry_price
-            exit_at     = cur_time
-            exit_reason = "Time Exit"
-        else:
-            candles = idx.get_candles_range(day, scan_start, exit_time, expiry, cur_strike, otype)
+        exit_price = exit_at = exit_reason = None
+        scanned_any = False
+        if scan_start <= scan_end:
+            scanned_any = True
+            candles = cur_idx.get_candles_range(cur_day, scan_start, scan_end, expiry, cur_strike, otype)
             exit_price, exit_at, exit_reason = _check_sl_target(
                 candles, entry_price, entry_spot, cur_position,
                 sl_type, sl_val, tgt_type, tgt_val,
-                idx, day,
+                cur_idx, cur_day,
                 trail_type=trail_type, trail_x=trail_x, trail_y=trail_y,
             )
-            if exit_price is None:
-                exit_price  = idx.get_close(day, exit_time, expiry, cur_strike, otype) or entry_price
-                exit_at     = exit_time
-                exit_reason = "Time Exit"
+
+        if exit_price is None and next_idx is not None and cur_day == day:
+            # Day 1 exhausted with no SL/Target hit — roll into Day 2 and
+            # keep scanning from Day 2's own first candle through the real
+            # exit_time. cur_idx/cur_day switch permanently (no Day 3).
+            cur_idx, cur_day = next_idx, next_day
+            day2_times = sorted(cur_idx._all_times.get(cur_day, []))
+            if day2_times and day2_times[0] <= exit_time:
+                scanned_any = True
+                candles2 = cur_idx.get_candles_range(cur_day, day2_times[0], exit_time, expiry, cur_strike, otype)
+                exit_price, exit_at, exit_reason = _check_sl_target(
+                    candles2, entry_price, entry_spot, cur_position,
+                    sl_type, sl_val, tgt_type, tgt_val,
+                    cur_idx, cur_day,
+                    trail_type=trail_type, trail_x=trail_x, trail_y=trail_y,
+                )
+
+        if exit_price is None:
+            # Matches the two distinct original fallbacks exactly: if no
+            # scan was ever attempted (entry landed at/after the cutoff),
+            # exit flat at cur_time with entry_price — never actually query
+            # a price at exit_time. Only once a scan was attempted (and
+            # found nothing) do we look up the real close at exit_time.
+            if scanned_any:
+                exit_price = cur_idx.get_close(cur_day, exit_time, expiry, cur_strike, otype) or entry_price
+                exit_at    = exit_time
+            else:
+                exit_price = entry_price
+                exit_at    = cur_time
+            exit_reason = "Time Exit"
 
         pnl        = _calc_pnl(cur_position, entry_price, exit_price, lots, lot_size)
         total_pnl += pnl
-        actual_exit_market_price = idx.get_close(day, exit_at, expiry, cur_strike, otype)
+        actual_exit_market_price = cur_idx.get_close(cur_day, exit_at, expiry, cur_strike, otype)
         if actual_exit_market_price is None:
             actual_exit_market_price = exit_price
 
@@ -762,7 +861,7 @@ def _process_leg(idx, day, entry_time, exit_time,
             re_type = reentry_tp_type.replace("ReentryType.", "")
 
         trade = {
-            "entry_date":          day,
+            "entry_date":          entry_day,
             "entry_time":          cur_time,
             "entry_action":        cur_position,
             "entry_price":         round(entry_price, 2),
@@ -774,7 +873,7 @@ def _process_leg(idx, day, entry_time, exit_time,
             "expiry":              expiry,
             "strike":              cur_strike,
             "option_type":         otype,
-            "exit_date":           day,
+            "exit_date":           cur_day,
             "exit_time":           exit_at,
             "exit_action":         _flip_position(cur_position),
             "exit_price":          round(exit_price, 2),
@@ -792,15 +891,16 @@ def _process_leg(idx, day, entry_time, exit_time,
         }
 
         # Momentum info — shown for ALL sub_trades when LegMomentum is active
+        # (always relative to this sub-trade's own entry — entry_idx/entry_day)
         if sub_base_price is not None:
             # ATM at listen_time
-            spot_listen    = idx.get_spot(day, listen_time)
+            spot_listen    = entry_idx.get_spot(entry_day, listen_time)
             atm_strike     = _find_atm(spot_listen, step) if spot_listen else None
-            atm_px_listen  = idx.get_close(day, listen_time, expiry, atm_strike, otype) if atm_strike else None
+            atm_px_listen  = entry_idx.get_close(entry_day, listen_time, expiry, atm_strike, otype) if atm_strike else None
 
             # Spot & ATM at actual entry time
-            spot_entry     = idx.get_spot(day, cur_time)
-            atm_px_entry   = idx.get_close(day, cur_time, expiry, atm_strike, otype) if atm_strike else None
+            spot_entry     = entry_idx.get_spot(entry_day, cur_time)
+            atm_px_entry   = entry_idx.get_close(entry_day, cur_time, expiry, atm_strike, otype) if atm_strike else None
 
             trade["momentum_type"]              = momentum_type.replace("MomentumType.", "")
             trade["momentum_value"]             = momentum_val
@@ -841,8 +941,11 @@ def _process_leg(idx, day, entry_time, exit_time,
 
             if "AtCost" in re_type:
                 # ── RE-COST: same strike, wait for price to return to entry price ──
-                wait_candles = idx.get_candles_range(
-                    day, _add_one_minute(exit_at), exit_time,
+                # Bounded to cur_day (wherever the exit that triggered this
+                # reentry landed) — a cost-return wait does not itself roll
+                # to a further day (no Day 3).
+                wait_candles = cur_idx.get_candles_range(
+                    cur_day, _add_one_minute(exit_at), exit_time,
                     expiry, cur_strike, otype,
                 )
                 cost_time, _ = _find_at_cost_reentry(
@@ -854,7 +957,7 @@ def _process_leg(idx, day, entry_time, exit_time,
                 if LIMIT_ORDER_EXECUTION:
                     forced_entry_price = entry_price
                 else:
-                    forced_entry_price = idx.get_close(day, cost_time, expiry, cur_strike, otype)
+                    forced_entry_price = cur_idx.get_close(cur_day, cost_time, expiry, cur_strike, otype)
                     if forced_entry_price is None:
                         break
                 cur_time = cost_time   # market order at the candle where price crossed cost
@@ -864,11 +967,11 @@ def _process_leg(idx, day, entry_time, exit_time,
 
             elif "LikeOriginal" in re_type:
                 # ── RE-MOMENTUM: new ATM + wait for momentum breakout ────────────
-                new_spot = idx.get_spot(day, exit_at)
+                new_spot = cur_idx.get_spot(cur_day, exit_at)
                 if new_spot is None:
                     break
                 new_strike = _pick_strike(
-                    idx, day, exit_at, expiry, otype, new_spot,
+                    cur_idx, cur_day, exit_at, expiry, otype, new_spot,
                     entry_type, strike_param, step,
                 )
                 if new_strike is None:
@@ -884,11 +987,11 @@ def _process_leg(idx, day, entry_time, exit_time,
 
             else:
                 # ── RE-ASAP / ImmediateReverse: new ATM strike, instant re-entry ──
-                new_spot = idx.get_spot(day, exit_at)
+                new_spot = cur_idx.get_spot(cur_day, exit_at)
                 if new_spot is None:
                     break
                 new_strike = _pick_strike(
-                    idx, day, exit_at, expiry, otype, new_spot,
+                    cur_idx, cur_day, exit_at, expiry, otype, new_spot,
                     entry_type, strike_param, step,
                 )
                 if new_strike is None:
@@ -1812,6 +1915,10 @@ def _apply_response_flags(day_trade: dict) -> dict:
     if not RETURN_TRADE_EXPLANATION:
         day_trade.pop("trade_explanation", None)
 
+    if not RETURN_TRADE_EXPLANATION_CONTENT:
+        day_trade.pop("trade_explanation_content", None)
+        return day_trade
+
     content = day_trade.get("trade_explanation_content")
     if isinstance(content, dict):
         if not RETURN_PNL_SUMMARY:
@@ -1921,13 +2028,9 @@ def _summary(trades: list) -> dict:
 from collections import OrderedDict
 import os
 import pathlib
-
-try:
-    import pyarrow as _pa
-    import pyarrow.parquet as _pq
-    _PARQUET_OK = True
-except ImportError:
-    _PARQUET_OK = False
+import sys
+import threading
+import time
 
 # ─── Cache Mode Toggle ────────────────────────────────────────────────────────
 # REDIS_MEMORY = True  → DataIndex stored in Redis (RAM). Lazy-loaded on first
@@ -1985,109 +2088,411 @@ def _pkl5_path(underlying: str, date: str) -> pathlib.Path:
     return _cache_dir(underlying) / f"{date}.pkl5"
 
 
-# Keep these so warm_cache.py still works
-def _parquet_path(underlying: str, date: str) -> pathlib.Path:
-    return _cache_dir(underlying) / f"{date}.parquet"
+# ─── Parquet Data Store (shared/parquet_data) — primary source, Mongo fallback ─
+# Populated by shared/parquet_export.py. Layout: parquet_data/{underlying}/{date}/data.parquet
 
-def _idx_pkl_path(underlying: str, date: str) -> pathlib.Path:
-    return _cache_dir(underlying) / f"{date}.idx.pkl"
+# Compacted store: shared/compact_nifty_parquet.py's output — one Parquet
+# file per symbol/year/month (expiry + strike_bucket kept as physical
+# columns, not folder partitions; see algo-backend/shared/compacted_loader.py
+# for the equivalent Polars query-planner used by other services). Replaces
+# the old per-day flat store (algo.trade/parquet_data/{underlying}/{date}/
+# data.parquet), which was never populated on this deployment.
+_PARQUET_STORE_ROOT = pathlib.Path(__file__).resolve().parent.parent.parent / "shared" / "parquet_data" / "compacted"
 
 
-def _build_index_from_raw(raw: list) -> "DataIndex":
-    """Build DataIndex from raw MongoDB candle list."""
+def _compacted_month_files(underlying: str, date: str) -> list:
+    """part-*.parquet files for the calendar month containing `date`."""
+    year, month = date[:4], date[5:7]
+    month_dir = _PARQUET_STORE_ROOT / f"symbol={underlying}" / f"year={year}" / f"month={month}"
+    if not month_dir.is_dir():
+        return []
+    return sorted(month_dir.glob("part-*.parquet"))
+
+
+def _parquet_store_path(underlying: str, date: str) -> pathlib.Path:
+    """The compacted month directory `date` falls in — used only for cheap
+    existence checks (_prewarm_parquet_cache), not for reading (see
+    _load_index_from_parquet_store, which scans _compacted_month_files)."""
+    year, month = date[:4], date[5:7]
+    return _PARQUET_STORE_ROOT / f"symbol={underlying}" / f"year={year}" / f"month={month}"
+
+
+def _parquet_store_has_data(start_date: str, end_date: str, underlying: str) -> bool:
+    """True if the compacted store has at least one exported month overlapping the range."""
+    root = _PARQUET_STORE_ROOT / f"symbol={underlying}"
+    if not root.is_dir():
+        return False
+    start_ym, end_ym = start_date[:7], end_date[:7]
+    for year_dir in root.glob("year=*"):
+        for month_dir in year_dir.glob("month=*"):
+            ym = f"{year_dir.name.split('=')[1]}-{month_dir.name.split('=')[1]}"
+            if start_ym <= ym <= end_ym and any(month_dir.glob("part-*.parquet")):
+                return True
+    return False
+
+
+def _build_data_index(date: str, df, has_hl: bool = False) -> Optional["DataIndex"]:
+    """
+    Build a DataIndex for one trading day from a polars DataFrame with columns
+    time_str, expiry_str, strike, option_type, close, spot_price, delta, and
+    (if has_hl) high, low.
+
+    Grouped by (time, expiry, type) — NOT per row. A day has ~127k rows but only
+    ~6k such groups; within a group, rows are sorted by strike (parquet_export.py's
+    SORT_COLUMNS already sort this way; Mongo-derived frames are sorted here) so a
+    strike lookup is np.searchsorted into a shared array slice instead of a dict
+    hash per row. This is what took cold builds from ~550ms/day to ~80ms/day.
+    """
+    if df.is_empty():
+        return None
+
+    df = df.sort(["time_str", "expiry_str", "option_type", "strike"])
+
+    grouped = df.group_by(["time_str", "expiry_str", "option_type"], maintain_order=True).agg(pl.len().alias("n"))
+    lengths = grouped["n"].to_numpy()
+    offsets = np.concatenate(([0], np.cumsum(lengths)))
+    groups: dict = {}
+    for i, (t, e, o) in enumerate(zip(grouped["time_str"], grouped["expiry_str"], grouped["option_type"])):
+        groups[(t, e, o)] = (int(offsets[i]), int(offsets[i + 1]))
+
+    strike_arr = df["strike"].to_numpy().astype(int)
+    close_arr  = df["close"].to_numpy().astype(float)
+    delta_arr  = df["delta"].to_numpy().astype(float)
+    if has_hl:
+        high_arr = df["high"].to_numpy().astype(float)
+        low_arr  = df["low"].to_numpy().astype(float)
+    else:
+        high_arr = close_arr
+        low_arr  = close_arr
+
+    spot_map = df.group_by("time_str", maintain_order=True).agg(pl.col("spot_price").first())
+    spot_index = {(date, t): float(sp) for t, sp in spot_map.iter_rows()}
+
+    # _time_map: (expiry, strike, option_type) -> the times that contract trades at,
+    # needed by get_candles_range for SL/target/re-entry time-series lookups. Stored
+    # as one flat int16 array (minutes-since-midnight) + a small offset dict — same
+    # flat-array-plus-offsets shape as _groups/_strike/_close/_delta above, instead of
+    # a dict of ~1000+ individual Python lists of "HH:MM" strings. Unpickling a plain
+    # numpy buffer is ~100x faster than reconstructing that many list/str objects
+    # (measured: this alone was ~12ms of a ~26ms/day pkl5 load).
+    tm_df = df.sort(["expiry_str", "strike", "option_type", "time_str"])
+    tm_minutes_arr = (
+        tm_df["time_str"].str.slice(0, 2).cast(pl.Int32) * 60
+        + tm_df["time_str"].str.slice(3, 2).cast(pl.Int32)
+    ).to_numpy().astype(np.int16)
+    tm_grouped = tm_df.group_by(["expiry_str", "strike", "option_type"], maintain_order=True).agg(pl.len().alias("n"))
+    tm_lengths = tm_grouped["n"].to_numpy()
+    tm_offsets = np.concatenate(([0], np.cumsum(tm_lengths)))
+    time_map_offsets: dict = {}
+    for i, (e, s, o) in enumerate(zip(tm_grouped["expiry_str"], tm_grouped["strike"], tm_grouped["option_type"])):
+        time_map_offsets[(e, int(s), o)] = (int(tm_offsets[i]), int(tm_offsets[i + 1]))
+
     idx = DataIndex.__new__(DataIndex)
-    idx.candle_index  = {}
-    idx.high_index    = {}
-    idx.low_index     = {}
-    idx.spot_index    = {}
-    idx.delta_index   = {}
-    _ei = defaultdict(set)
-    _at = defaultdict(set)
-    _tm = defaultdict(list)
-    _si = defaultdict(set)
+    idx.date               = date
+    idx._groups             = groups
+    idx._strike             = strike_arr
+    idx._close              = close_arr
+    idx._delta              = delta_arr
+    idx._high                = high_arr
+    idx._low                 = low_arr
+    idx.spot_index          = spot_index
+    idx.expiry_index        = {date: sorted(set(df["expiry_str"].to_list()))}
+    idx._all_times           = {date: sorted(set(df["time_str"].to_list()))}
+    idx._time_map_minutes    = tm_minutes_arr
+    idx._time_map_offsets    = time_map_offsets
+    return idx
 
+
+# In-process cache of whole compacted months (post-projection, with time_str/
+# expiry_str already derived) — a month file is ~98MB decompressed once, then
+# every day within it is a cheap in-memory filter instead of a fresh Parquet
+# decompress. _load_index_cached's pkl5/Redis layer still makes the *day*
+# itself only pay this cost once per (underlying, date) ever — this cache
+# only helps the first pass across a date range, before pkl5 exists.
+#
+# Kept small on purpose: trading_days is processed in chronological order, so
+# at most the current month (+ the previous one, for BTST/positional 1-day
+# lookback across a month boundary) is ever actually "hot" — a bigger cache
+# just holds cold months nobody will revisit. This matters because a
+# portfolio backtest runs one of these caches PER STRATEGY subprocess in
+# parallel (see api.py's _run_portfolio_job / ProcessPoolExecutor): the old
+# limit of 15 was ~1.47GB/process on its own (98MB x 15), so a 5-strategy
+# portfolio could burn ~7.4GB on this cache alone — a real suspect for the
+# portfolio jobs observed stuck at "running" with no error (SIGKILL/OOM kills
+# bypass Python's except block entirely, so the job state never updates past
+# its last-written progress). 2 keeps the per-process footprint under 200MB.
+_MONTH_DF_CACHE: "OrderedDict[tuple[str, str, str], pl.DataFrame]" = OrderedDict()
+_MONTH_DF_CACHE_MAX = 2
+
+
+def _load_compacted_month_df(underlying: str, date: str) -> Optional[pl.DataFrame]:
+    year, month = date[:4], date[5:7]
+    key = (underlying, year, month)
+    cached = _MONTH_DF_CACHE.get(key)
+    if cached is not None:
+        _MONTH_DF_CACHE.move_to_end(key)
+        return cached
+
+    files = _compacted_month_files(underlying, date)
+    if not files:
+        return None
+    df = (
+        pl.scan_parquet([str(f) for f in files], parallel="auto", rechunk=False, low_memory=False)
+        .select(["trade_date", "timestamp", "expiry", "strike", "option_type", "close", "spot_price", "delta"])
+        .collect()
+        .with_columns([
+            # pl.col(...).dt.strftime("%H:%M") is ~30% slower than building the same
+            # string from the native hour()/minute() integer accessors — verified
+            # byte-identical output, just a faster codepath through polars.
+            (pl.col("timestamp").dt.hour().cast(pl.Utf8).str.zfill(2) + pl.lit(":")
+             + pl.col("timestamp").dt.minute().cast(pl.Utf8).str.zfill(2)).alias("time_str"),
+            pl.col("expiry").cast(pl.Utf8).alias("expiry_str"),
+            pl.col("option_type").cast(pl.Utf8),
+        ])
+    )
+    _MONTH_DF_CACHE[key] = df
+    if len(_MONTH_DF_CACHE) > _MONTH_DF_CACHE_MAX:
+        _MONTH_DF_CACHE.popitem(last=False)
+    return df
+
+
+def _load_index_from_parquet_store(underlying: str, date: str) -> Optional["DataIndex"]:
+    """Load one day's option chain from the compacted Parquet store (no Mongo).
+    The month this day belongs to is decompressed once (_load_compacted_month_df)
+    and kept in an in-process cache — every other day in the same month is then a
+    cheap in-memory filter, not a fresh Parquet scan."""
+    month_df = _load_compacted_month_df(underlying, date)
+    if month_df is None:
+        return None
+    df = month_df.filter(pl.col("trade_date") == pl.lit(date).str.to_date())
+    if df.is_empty():
+        return None
+    return _build_data_index(date, df, has_hl=False)
+
+
+def _build_index_from_raw(raw: list) -> Optional["DataIndex"]:
+    """Build DataIndex from a raw MongoDB candle list (fallback when a day isn't in the parquet store)."""
+    if not raw:
+        return None
+    date_strs, time_strs, expiries, strikes, types = [], [], [], [], []
+    closes, spots, deltas, highs, lows = [], [], [], [], []
+    has_hl = False
+    date = raw[0]["timestamp"][:10]
     for c in raw:
         try:
-            ts       = c["timestamp"]
-            date_str = ts[:10];  time_str = ts[11:16]
-            expiry   = c["expiry"]
-            strike   = int(c["strike"])
-            otype    = c["type"]
-            close    = float(c["close"])
-            spot     = float(c.get("spot_price", 0))
-            high     = float(c.get("high", close))
-            low      = float(c.get("low",  close))
-            delta    = c.get("delta")
-            key = (date_str, time_str, expiry, strike, otype)
-            idx.candle_index[key] = close
-            idx.high_index[key]   = high
-            idx.low_index[key]    = low
-            idx.spot_index[(date_str, time_str)] = spot
-            if delta is not None:
-                idx.delta_index[key] = float(delta)
-            _ei[date_str].add(expiry)
-            _at[date_str].add(time_str)
-            _tm[(date_str, expiry, strike, otype)].append(time_str)
-            _si[(date_str, time_str, expiry, otype)].add(strike)
+            ts = c["timestamp"]
+            close = float(c["close"])
+            high  = c.get("high")
+            low   = c.get("low")
+            if high is not None and low is not None:
+                has_hl = True
+            date_strs.append(ts[:10]); time_strs.append(ts[11:16])
+            expiries.append(str(c["expiry"])); strikes.append(int(c["strike"]))
+            types.append(c["type"]); closes.append(close)
+            spots.append(float(c.get("spot_price", 0)))
+            deltas.append(c["delta"] if c.get("delta") is not None else float("nan"))
+            highs.append(float(high) if high is not None else close)
+            lows.append(float(low) if low is not None else close)
         except KeyError:
             pass
+    if not date_strs:
+        return None
 
-    # If no real high/low data, share candle_index reference (saves ~32ms on load)
-    if idx.high_index == idx.candle_index:
-        idx.high_index = idx.candle_index
-        idx.low_index  = idx.candle_index
+    df = pl.DataFrame({
+        "time_str": time_strs, "expiry_str": expiries, "strike": strikes,
+        "option_type": types, "close": closes, "spot_price": spots, "delta": deltas,
+        "high": highs, "low": lows,
+    })
+    return _build_data_index(date, df, has_hl=has_hl)
 
-    idx.expiry_index  = {k: sorted(v) for k, v in _ei.items()}
-    idx._all_times    = {k: sorted(v) for k, v in _at.items()}
-    idx._time_map     = {k: sorted(set(v)) for k, v in _tm.items()}
-    idx.strikes_index = {k: sorted(v) for k, v in _si.items()}
+
+# Bumped whenever the payload shape changes. _index_from_payload raises on a
+# mismatch so stale caches (old dict-per-row format, or future format changes)
+# are transparently rebuilt instead of crashing — same pattern the old
+# 'delta_index missing' check used.
+# fmt 3: strikes_index dropped (redundant with _groups+_strike, already sorted);
+# _time_map replaced with _time_map_minutes (flat int16 array) + _time_map_offsets
+# (small dict) — was ~22ms/day of the ~26ms/day pkl5 unpickle cost, see backtest
+# timing investigation. Every existing fmt-2 .pkl5 on disk is just treated as a
+# cache miss and rebuilt once, same as any other stale-cache case.
+_INDEX_PAYLOAD_FMT = 3
+
+
+def _index_to_payload(idx: "DataIndex") -> dict:
+    has_hl = idx._high is not idx._close
+    payload = {
+        'fmt': _INDEX_PAYLOAD_FMT,
+        'date': idx.date,
+        'groups': idx._groups,
+        'strike': idx._strike,
+        'close': idx._close,
+        'delta': idx._delta,
+        'has_hl': has_hl,
+        'spot_index': idx.spot_index,
+        'expiry_index': idx.expiry_index,
+        '_all_times': idx._all_times,
+        '_time_map_minutes': idx._time_map_minutes,
+        '_time_map_offsets': idx._time_map_offsets,
+    }
+    if has_hl:
+        payload['high'] = idx._high
+        payload['low']  = idx._low
+    return payload
+
+
+def _index_from_payload(d: dict) -> "DataIndex":
+    if d.get('fmt') != _INDEX_PAYLOAD_FMT:
+        raise KeyError(f"stale cache: expected fmt={_INDEX_PAYLOAD_FMT}")
+    idx = DataIndex.__new__(DataIndex)
+    idx.date               = d['date']
+    idx._groups             = d['groups']
+    idx._strike             = d['strike']
+    idx._close              = d['close']
+    idx._delta              = d['delta']
+    idx.spot_index          = d['spot_index']
+    idx.expiry_index        = d['expiry_index']
+    idx._all_times           = d['_all_times']
+    idx._time_map_minutes    = d['_time_map_minutes']
+    idx._time_map_offsets    = d['_time_map_offsets']
+    if d.get('has_hl'):
+        idx._high = d['high']
+        idx._low  = d['low']
+    else:
+        idx._high = idx._close
+        idx._low  = idx._close
     return idx
 
 
 def _save_pkl5(idx: "DataIndex", path: pathlib.Path):
-    """Save full DataIndex as a single pickle5 file (~4.5MB, loads in ~40ms)."""
-    has_hl = idx.high_index is not idx.candle_index
-    delta_index = getattr(idx, 'delta_index', {})
-    data = {
-        'candle_index':  idx.candle_index,
-        'spot_index':    idx.spot_index,
-        'expiry_index':  idx.expiry_index,
-        '_all_times':    idx._all_times,
-        '_time_map':     idx._time_map,
-        'strikes_index': idx.strikes_index,
-        'has_hl':        has_hl,
-        'delta_index':   delta_index,
-    }
-    if has_hl:
-        data['high_index'] = idx.high_index
-        data['low_index']  = idx.low_index
-    with open(path, 'wb') as f:
-        _pickle.dump(data, f, protocol=5)
+    """
+    Save full DataIndex as a single pickle5 file (numpy arrays + small group
+    dicts). Writes to a temp file then renames into place — atomic, so a
+    concurrent reader (another day-load, or another process/subprocess
+    warming the same day) never sees a partially-written file.
+    """
+    tmp_path = path.with_suffix(path.suffix + f".tmp{os.getpid()}")
+    with open(tmp_path, 'wb') as f:
+        _pickle.dump(_index_to_payload(idx), f, protocol=5)
+    os.replace(tmp_path, path)
+
+
+import queue as _queue
+
+# Fixed pool of long-lived daemon workers for background pkl5 writes, instead
+# of spawning a new thread per call. A cold multi-month backtest calls
+# _save_pkl5_background once per day — 200+ threads (each with a default 8MB
+# stack, ~1.6GB+ just in stack memory) piling up under I/O contention was a
+# real suspect behind portfolio-backtest coordinator processes observed with
+# 27-28 live threads and stuck for minutes at shutdown (worker process exit
+# waits on outstanding thread/interpreter cleanup). Daemon=True still means
+# these never block process exit even with a non-empty queue — worst case on
+# exit is the same "missing pkl5, cold next time" as before.
+_PKL5_WRITE_QUEUE: "_queue.Queue" = _queue.Queue()
+_PKL5_WORKERS_STARTED = False
+_PKL5_WORKERS_LOCK = threading.Lock()
+_PKL5_WORKER_COUNT = 4
+
+
+def _pkl5_write_worker() -> None:
+    while True:
+        item = _PKL5_WRITE_QUEUE.get()
+        try:
+            idx, path = item
+            _save_pkl5(idx, path)
+        except Exception:
+            pass
+        finally:
+            _PKL5_WRITE_QUEUE.task_done()
+
+
+def _ensure_pkl5_workers() -> None:
+    global _PKL5_WORKERS_STARTED
+    if _PKL5_WORKERS_STARTED:
+        return
+    with _PKL5_WORKERS_LOCK:
+        if _PKL5_WORKERS_STARTED:
+            return
+        for _ in range(_PKL5_WORKER_COUNT):
+            threading.Thread(target=_pkl5_write_worker, daemon=True).start()
+        _PKL5_WORKERS_STARTED = True
+
+
+def _save_pkl5_background(idx: "DataIndex", path: pathlib.Path):
+    """
+    Queue a pkl5 write for one of a fixed pool of background workers — the
+    day-loading caller doesn't need to wait for the disk write to finish
+    before moving on to simulate that day (~20-30ms/day observed).
+    """
+    _ensure_pkl5_workers()
+    _PKL5_WRITE_QUEUE.put((idx, path))
 
 
 def _load_pkl5(path: pathlib.Path) -> "DataIndex":
-    """Load DataIndex from .pkl5 file in ~40ms."""
+    """Load DataIndex from .pkl5 file."""
     with open(path, 'rb') as f:
         d = _pickle.load(f)
-    # Cache files saved before delta support was added lack 'delta_index'.
-    # Raise so the caller invalidates the file and falls through to MongoDB rebuild.
-    if 'delta_index' not in d:
-        raise KeyError("stale cache: missing delta_index")
-    idx = DataIndex.__new__(DataIndex)
-    idx.candle_index  = d['candle_index']
-    idx.spot_index    = d['spot_index']
-    idx.expiry_index  = d['expiry_index']
-    idx._all_times    = d['_all_times']
-    idx._time_map     = d['_time_map']
-    idx.strikes_index = d['strikes_index']
-    idx.delta_index   = d['delta_index']
-    if d.get('has_hl'):
-        idx.high_index = d['high_index']
-        idx.low_index  = d['low_index']
-    else:
-        idx.high_index = idx.candle_index
-        idx.low_index  = idx.candle_index
-    return idx
+    return _index_from_payload(d)
+
+
+def _prewarm_parquet_cache(underlying: str, trading_days: list) -> None:
+    """
+    Build .pkl5 cache for every trading day (that's in the parquet store and not
+    already cached) in parallel, BEFORE the main simulation loop runs — so that
+    loop's sequential per-day _load_index_cached calls all hit the warm path.
+
+    Uses subprocess.Popen (real OS processes), not multiprocessing.Pool/
+    ProcessPoolExecutor: the API layer (algo.trade/api.py's backtest_start)
+    runs run_backtest() inside a `multiprocessing.Process(..., daemon=True)`
+    job process, and daemonic multiprocessing processes are not allowed to
+    spawn multiprocessing children (raises AssertionError). subprocess.Popen
+    is a plain OS fork+exec, unaffected by that restriction.
+
+    Best-effort: any day that fails to prewarm just falls through to the
+    existing per-day fallback (parquet inline, or Mongo) inside the simulation
+    loop's own _load_index_cached call — this function never raises.
+    """
+    missing = [
+        d for d in trading_days
+        if not _pkl5_path(underlying, d).exists() and _parquet_store_path(underlying, d).exists()
+    ]
+    # _parquet_store_path now checks month-directory existence (compacted store),
+    # not a per-day file, so a day with a genuine data gap inside an otherwise-
+    # exported month always shows up here as "missing" and can never be prewarmed
+    # (parquet has no row for it) — every backtest would keep re-paying subprocess
+    # spawn overhead (~0.5-1s/worker just for Python+numpy+polars import) trying
+    # to prewarm the same handful of always-failing days. Per-day cold build is
+    # now ~90ms (see _build_data_index), so below ~8 missing days the sequential
+    # inline fallback in the main loop is faster than parallel subprocess spawn
+    # overhead anyway — only worth the fan-out for a real backlog.
+    if len(missing) < 8:
+        return
+
+    workers = min(os.cpu_count() or 4, 8, len(missing))
+    chunks = [missing[i::workers] for i in range(workers)]
+
+    import subprocess
+    # Each worker process would otherwise spin up its own internal polars
+    # thread pool sized to all cores (polars parallelizes group_by/read
+    # internally) — N worker processes x that many polars threads each is
+    # heavy oversubscription on an 8-core box. Cap each worker to 1 polars
+    # thread so the outer process-level fan-out is the only parallelism.
+    env = dict(os.environ, POLARS_MAX_THREADS="1")
+    procs = []
+    try:
+        for chunk in chunks:
+            if not chunk:
+                continue
+            proc = subprocess.Popen(
+                [sys.executable, __file__, "--prewarm", underlying, *chunk],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=env,
+            )
+            procs.append(proc)
+        for proc in procs:
+            proc.wait(timeout=300)
+    except Exception:
+        for proc in procs:
+            if proc.poll() is None:
+                proc.kill()
 
 
 # compat shim: warm_cache.py calls these
@@ -2101,6 +2506,23 @@ def _dataindex_from_df(df):
     pass  # no longer needed
 
 
+# Per-process timing breakdown for one run_backtest() call — reset at the
+# start of run_backtest, printed at the end. Each backtest job runs in its
+# own multiprocessing.Process (see _prewarm_parquet_cache's docstring), so
+# this module-level dict is never shared across concurrent backtests.
+_TIMING_STATS = {
+    "redis_hits": 0, "redis_time": 0.0,
+    "pkl5_hits": 0, "pkl5_time": 0.0,
+    "parquet_cold_hits": 0, "parquet_cold_time": 0.0,
+    "mongo_cold_hits": 0, "mongo_cold_time": 0.0,
+}
+
+
+def _reset_timing_stats() -> None:
+    for k in list(_TIMING_STATS):
+        _TIMING_STATS[k] = 0 if k.endswith("_hits") else 0.0
+
+
 def _load_index_cached(db, underlying: str, date: str) -> "Optional[DataIndex]":
     """
     Load DataIndex from cache or MongoDB.
@@ -2110,6 +2532,10 @@ def _load_index_cached(db, underlying: str, date: str) -> "Optional[DataIndex]":
     REDIS_MEMORY=False fast path: pkl5 disk load (~60ms/day).
     Legacy path: old parquet+.idx.pkl → upgraded to .pkl5 on first access.
     Cold path: MongoDB → build DataIndex → save .pkl5 (~800ms first time).
+
+    Every path is timed into _TIMING_STATS so run_backtest can print a
+    per-source breakdown (print("[BACKTEST TIMING] ...")) at the end —
+    "where is the time going" without needing an external profiler.
     """
     # ── Redis fast path ───────────────────────────────────────────────────────
     if REDIS_MEMORY:
@@ -2119,45 +2545,24 @@ def _load_index_cached(db, underlying: str, date: str) -> "Optional[DataIndex]":
         try:
             raw_bytes = r.get(key)
             if raw_bytes:
-                d   = _pkl.loads(raw_bytes)
-                idx = DataIndex.__new__(DataIndex)
-                idx.candle_index  = d['candle_index']
-                idx.spot_index    = d['spot_index']
-                idx.expiry_index  = d['expiry_index']
-                idx._all_times    = d['_all_times']
-                idx._time_map     = d['_time_map']
-                idx.strikes_index = d['strikes_index']
-                idx.delta_index   = d.get('delta_index', {})
-                if d.get('has_hl'):
-                    idx.high_index = d['high_index']
-                    idx.low_index  = d['low_index']
-                else:
-                    idx.high_index = idx.candle_index
-                    idx.low_index  = idx.candle_index
+                t0 = time.perf_counter()
+                idx = _index_from_payload(_pkl.loads(raw_bytes))
+                _TIMING_STATS["redis_hits"] += 1
+                _TIMING_STATS["redis_time"] += time.perf_counter() - t0
                 return idx
         except Exception:
-            pass  # Redis error → fall through to pkl5
+            pass  # Redis error or stale format → fall through to pkl5
 
         # Miss: load from pkl5 and push to Redis
         pkl5 = _pkl5_path(underlying, date)
         if pkl5.exists():
             try:
+                t0 = time.perf_counter()
                 with open(pkl5, 'rb') as f:
                     d = _pkl.load(f)
-                idx = DataIndex.__new__(DataIndex)
-                idx.candle_index  = d['candle_index']
-                idx.spot_index    = d['spot_index']
-                idx.expiry_index  = d['expiry_index']
-                idx._all_times    = d['_all_times']
-                idx._time_map     = d['_time_map']
-                idx.strikes_index = d['strikes_index']
-                idx.delta_index   = d.get('delta_index', {})
-                if d.get('has_hl'):
-                    idx.high_index = d['high_index']
-                    idx.low_index  = d['low_index']
-                else:
-                    idx.high_index = idx.candle_index
-                    idx.low_index  = idx.candle_index
+                idx = _index_from_payload(d)
+                _TIMING_STATS["pkl5_hits"] += 1
+                _TIMING_STATS["pkl5_time"] += time.perf_counter() - t0
                 # Store in Redis (no TTL — persists until server restart)
                 try:
                     r.set(key, _pkl.dumps(d, protocol=5))
@@ -2167,20 +2572,23 @@ def _load_index_cached(db, underlying: str, date: str) -> "Optional[DataIndex]":
             except Exception:
                 pkl5.unlink(missing_ok=True)
 
-        # pkl5 missing — cold path (MongoDB)
-        raw = db.load_day(date, underlying)
-        if not raw:
-            return None
-        idx = _build_index_from_raw(raw)
+        # pkl5 missing — cold path (parquet store, falling back to MongoDB)
+        t0 = time.perf_counter()
+        idx = _load_index_from_parquet_store(underlying, date)
+        if idx is not None:
+            _TIMING_STATS["parquet_cold_hits"] += 1
+            _TIMING_STATS["parquet_cold_time"] += time.perf_counter() - t0
+        else:
+            t0 = time.perf_counter()
+            raw = db.load_day(date, underlying)
+            _TIMING_STATS["mongo_cold_hits"] += 1
+            _TIMING_STATS["mongo_cold_time"] += time.perf_counter() - t0
+            if not raw:
+                return None
+            idx = _build_index_from_raw(raw)
         try:
-            _save_pkl5(idx, _pkl5_path(underlying, date))
-            d = {
-                'candle_index': idx.candle_index, 'spot_index': idx.spot_index,
-                'expiry_index': idx.expiry_index, '_all_times': idx._all_times,
-                '_time_map': idx._time_map, 'strikes_index': idx.strikes_index,
-                'has_hl': idx.high_index is not idx.candle_index,
-                'delta_index': idx.delta_index,
-            }
+            d = _index_to_payload(idx)
+            _save_pkl5_background(idx, _pkl5_path(underlying, date))
             r.set(key, _pkl.dumps(d, protocol=5))
         except Exception:
             pass
@@ -2192,71 +2600,30 @@ def _load_index_cached(db, underlying: str, date: str) -> "Optional[DataIndex]":
     # ── Fast path ────────────────────────────────────────────────────────────
     if pkl5.exists():
         try:
-            return _load_pkl5(pkl5)
+            t0 = time.perf_counter()
+            idx = _load_pkl5(pkl5)
+            _TIMING_STATS["pkl5_hits"] += 1
+            _TIMING_STATS["pkl5_time"] += time.perf_counter() - t0
+            return idx
         except Exception:
             pkl5.unlink(missing_ok=True)
 
-    # ── Legacy upgrade: old parquet + .idx.pkl → rebuild as .pkl5 ────────────
-    pq_path  = _parquet_path(underlying, date)
-    old_pkl  = _idx_pkl_path(underlying, date)
-    if _PARQUET_OK and pq_path.exists():
-        try:
-            import pyarrow.parquet as _pq2
-            df = _pq2.read_table(str(pq_path)).to_pandas()
-            date_strs = df['date_str'].tolist(); time_strs = df['time_str'].tolist()
-            expiries  = df['expiry'].tolist();   strikes   = df['strike'].tolist()
-            types     = df['type'].tolist();     closes    = df['close'].tolist()
-            spots     = df['spot_price'].tolist()
-            highs = df['high'].tolist() if 'high' in df.columns else closes
-            lows  = df['low'].tolist()  if 'low'  in df.columns else closes
-            keys  = list(zip(date_strs, time_strs, expiries, strikes, types))
-            idx   = DataIndex.__new__(DataIndex)
-            idx.candle_index = dict(zip(keys, closes))
-            idx.delta_index  = {}   # parquet format predates delta — no delta data
-            if highs is closes:
-                idx.high_index = idx.candle_index
-                idx.low_index  = idx.candle_index
-            else:
-                idx.high_index = dict(zip(keys, highs))
-                idx.low_index  = dict(zip(keys, lows))
-            idx.spot_index = dict(zip(zip(date_strs, time_strs), spots))
-            # expiry/time/strikes from old pkl if present, else rebuild
-            if old_pkl.exists():
-                with open(old_pkl, 'rb') as f:
-                    sv = _pickle.load(f)
-                idx.expiry_index  = sv['expiry_index']
-                idx._all_times    = sv['_all_times']
-                idx._time_map     = sv['_time_map']
-                idx.strikes_index = sv['strikes_index']
-            else:
-                _ei=defaultdict(set); _at=defaultdict(set)
-                _tm=defaultdict(list); _si=defaultdict(set)
-                for d,t,e,s,o in zip(date_strs,time_strs,expiries,strikes,types):
-                    _ei[d].add(e); _at[d].add(t)
-                    _tm[(d,e,s,o)].append(t); _si[(d,t,e,o)].add(s)
-                idx.expiry_index  = {k:sorted(v) for k,v in _ei.items()}
-                idx._all_times    = {k:sorted(v) for k,v in _at.items()}
-                idx._time_map     = {k:sorted(set(v)) for k,v in _tm.items()}
-                idx.strikes_index = {k:sorted(v) for k,v in _si.items()}
-            # Save as pkl5 for next time, clean up old files
-            try:
-                _save_pkl5(idx, pkl5)
-                pq_path.unlink(missing_ok=True)
-                old_pkl.unlink(missing_ok=True)
-            except Exception:
-                pass
-            return idx
-        except Exception:
-            pq_path.unlink(missing_ok=True)
-
-    # ── Cold path: query MongoDB ──────────────────────────────────────────────
-    raw = db.load_day(date, underlying)
-    if not raw:
-        return None
-
-    idx = _build_index_from_raw(raw)
+    # ── Cold path: parquet store (shared/parquet_data), falling back to MongoDB ──
+    t0 = time.perf_counter()
+    idx = _load_index_from_parquet_store(underlying, date)
+    if idx is not None:
+        _TIMING_STATS["parquet_cold_hits"] += 1
+        _TIMING_STATS["parquet_cold_time"] += time.perf_counter() - t0
+    else:
+        t0 = time.perf_counter()
+        raw = db.load_day(date, underlying)
+        _TIMING_STATS["mongo_cold_hits"] += 1
+        _TIMING_STATS["mongo_cold_time"] += time.perf_counter() - t0
+        if not raw:
+            return None
+        idx = _build_index_from_raw(raw)
     try:
-        _save_pkl5(idx, pkl5)
+        _save_pkl5_background(idx, pkl5)
     except Exception:
         pass
     return idx
@@ -2282,6 +2649,29 @@ def run_backtest(request: dict, on_progress=None) -> dict:
     entry_time  = f"{entry_h:02d}:{entry_m:02d}"
     exit_time   = f"{exit_h:02d}:{exit_m:02d}"
 
+    # Signal-driven backtest: when the Signal Chart's own Test Signal
+    # entry/exit pairs should dictate trade timing instead of the fixed
+    # daily entry_time/exit_time above (see SignalTradeWindows produced by
+    # algo-admin's StrategyConfigModal for the Signal popup's "Start
+    # Backtest" flow). Grouped by date since a single day can hold more
+    # than one signal-driven trade window (unlike the fixed daily-time
+    # flow below, which is always exactly one window per day).
+    signal_windows_by_day: Optional[dict] = None
+    _signal_windows = strategy.get("SignalTradeWindows")
+    if _signal_windows:
+        signal_windows_by_day = {}
+        for _w in _signal_windows:
+            signal_windows_by_day.setdefault(_w["date"], []).append(
+                (_w["entry_time"], _w["exit_time"])
+            )
+    # Positional Range Breakout re-derives its own entry time from a
+    # multi-day high/low range scan (see leg_rb_type selection below) —
+    # that must NOT override a signal-driven window's own entry/exit, since
+    # the whole point of a signal-driven run is that the Signal Chart's
+    # Test Signal pair already IS the entry/exit. Positional Range Breakout
+    # only applies when there's no signal driving the window.
+    is_signal_driven = signal_windows_by_day is not None
+
     # ── Overall configs (parsed once, applied per day) ───────────────────────
     overall_sl_type,      overall_sl_val       = parse_overall_sl(strategy)
     overall_tgt_type,     overall_tgt_val      = parse_overall_tgt(strategy)
@@ -2293,16 +2683,29 @@ def run_backtest(request: dict, on_progress=None) -> dict:
     rb_type, rb_condition, rb_start, rb_end, rb_start_dte, rb_end_dte = \
         parse_range_breakout(strategy)
 
+    _reset_timing_stats()
+    _t_start = time.perf_counter()
+
     # ── 1. Load metadata (holidays, lot size) — no candle data yet ───────────
     holidays      = db.get_holidays()
     lot_size      = db.get_lot_size(start_date, underlying)
     trading_days  = _get_trading_days(start_date, end_date, holidays)
+    _t_metadata = time.perf_counter()
+
+    # Parallel-prewarm the pkl5 cache for every day in range before the sequential
+    # simulation loop below starts — turns N sequential cold-day-builds into one
+    # short parallel burst instead of paying the cold cost once per day serially.
+    _prewarm_parquet_cache(underlying, trading_days)
+    _t_prewarm = time.perf_counter()
 
     # Preflight: fail fast if no historical data exists for this range
-    if not db.has_data(start_date, end_date, underlying):
+    # (parquet store checked first — that's the primary source; Mongo is the fallback)
+    if not _parquet_store_has_data(start_date, end_date, underlying) \
+            and not db.has_data(start_date, end_date, underlying):
         raise ValueError(
             f"No data available for {underlying} between {start_date} and {end_date}. "
-            f"Please check that data has been loaded into option_chain_historical_data."
+            f"Please check that data has been exported to shared/parquet_data/{underlying}/ "
+            f"or loaded into option_chain_historical_data."
         )
     expiry_rules  = db.get_expiry_rules(underlying)   # loaded once from DB
     total_days   = len(trading_days)
@@ -2310,6 +2713,20 @@ def run_backtest(request: dict, on_progress=None) -> dict:
     trades = []
     is_btst       = "BTST"       in rb_type
     is_positional = "Positional" in rb_type
+    # Per-leg BTST Range Breakout (the real AlgoTest feature — each leg gets
+    # its own range/breakout config, see parse_leg_range_breakout) needs
+    # Day-1 data loaded too, independent of the legacy strategy-level
+    # `rb_type`/`is_btst` above (which today is effectively dead — nothing
+    # in the frontend writes a BTST-typed strategy-level RangeBreakout
+    # anymore, only per-leg LegRangeBreakout).
+    any_leg_btst = any(
+        "BTST" in parse_leg_range_breakout(leg)[0] for leg in legs
+    )
+    # Whole-strategy BTST: StrategyType.BTST means entry on Day 1 at
+    # entry_time, exit on Day 2 (next trading day) at exit_time — independent
+    # of the per-leg Range Breakout feature above. Previously this label was
+    # written by the frontend but never read anywhere in the backend.
+    is_whole_strategy_btst = "BTST" in str(strategy.get("StrategyType") or "")
     total_steps   = total_days
 
     if on_progress and total_steps > 0:
@@ -2329,13 +2746,39 @@ def run_backtest(request: dict, on_progress=None) -> dict:
         # ── BTST: load previous day from cache (fast on repeat runs) ─────────
         prev_trading_day = trading_days[day_idx - 1] if day_idx > 0 else None
         prev_idx: Optional[DataIndex] = None
-        if is_btst and prev_trading_day:
+        if (is_btst or any_leg_btst) and prev_trading_day:
             prev_idx = _load_index_cached(db, underlying, prev_trading_day)
 
+        # ── Whole-strategy BTST: load NEXT trading day (exit lands there) ────
+        # No Day 2 available (e.g. `day` is the last trading day in range) —
+        # a BTST pair can't form, skip this day entirely, same convention as
+        # the "no data" skips above.
+        next_day: Optional[str] = None
+        next_idx: Optional[DataIndex] = None
+        if is_whole_strategy_btst:
+            next_day = trading_days[day_idx + 1] if day_idx + 1 < len(trading_days) else None
+            if not next_day:
+                if on_progress:
+                    on_progress(day_idx + 1, total_steps,
+                                f"Processing {day_idx + 1}/{total_days}: {day}")
+                continue
+            next_idx = _load_index_cached(db, underlying, next_day)
+            if not next_idx:
+                if on_progress:
+                    on_progress(day_idx + 1, total_steps,
+                                f"Processing {day_idx + 1}/{total_days}: {day}")
+                continue
+
         # ── Positional ORB: DTE check + load all range days ───────────────────
+        # Skipped entirely when signal-driven (is_signal_driven) — this DTE
+        # gate would otherwise `continue` past every day that isn't exactly
+        # rb_end_dte away from expiry, silently dropping the signal's own
+        # windows on every other day. A signal-driven run's own windows
+        # already say which days/times to trade; Positional ORB's day
+        # selection must not additionally filter that.
         positional_start_day  = None
         positional_range_data = []   # [(day_str, DataIndex)]
-        if is_positional:
+        if is_positional and not is_signal_driven:
             expiries_today = idx.get_expiries(day)
             if not expiries_today:
                 continue
@@ -2360,412 +2803,523 @@ def run_backtest(request: dict, on_progress=None) -> dict:
                 if rd_idx:
                     positional_range_data.append((rd, rd_idx))
 
-        spot = idx.get_spot(day, entry_time)
-        if spot is None:
-            continue
-
         expiries = idx.get_expiries(day)
         if not expiries:
             continue
 
-        # ── Overall SL: static or trailing ───────────────────────────────────
-        if trail_sl_type != "None" and overall_sl_type != "None":
-            overall_sl_exit_time = find_trail_sl_exit_time(
-                idx, day, entry_time, exit_time,
-                legs, expiries, step, lot_size,
-                overall_sl_type, overall_sl_val,
-                trail_sl_type, trail_sl_for_every, trail_sl_by, spot,
-            )
+        if signal_windows_by_day is not None:
+            day_windows = signal_windows_by_day.get(day, [])
         else:
-            overall_sl_exit_time = find_overall_sl_exit_time(
-                idx, day, entry_time, exit_time,
-                legs, expiries, step, lot_size,
-                overall_sl_type, overall_sl_val, spot,
-                idle_configs=strategy.get("IdleLegConfigs", {}),
+            day_windows = [(entry_time, exit_time)]
+
+        for entry_time, exit_time in day_windows:
+            spot = idx.get_spot(day, entry_time)
+            if spot is None:
+                continue
+
+            # BTST forwarding args — None for every non-BTST day (identical
+            # to the old call signature, so behavior is unchanged there).
+            _btst_kwargs = (
+                dict(next_idx=next_idx, next_day=next_day, next_exit_time=exit_time)
+                if is_whole_strategy_btst else {}
             )
+            _eod_exit_date = next_day if is_whole_strategy_btst else day
 
-        # ── Overall Target ────────────────────────────────────────────────────
-        overall_tgt_exit_time = find_overall_tgt_exit_time(
-            idx, day, entry_time, exit_time,
-            legs, expiries, step, lot_size,
-            overall_tgt_type, overall_tgt_val, spot,
-            idle_configs=strategy.get("IdleLegConfigs", {}),
-        )
-
-        # ── Lock / Lock and Trail ─────────────────────────────────────────────
-        if lock_type == "Lock":
-            lock_exit_time = find_lock_exit_time(
-                idx, day, entry_time, exit_time,
-                legs, expiries, step, lot_size,
-                lock_trigger, lock_floor, spot,
-            )
-        elif lock_type == "LockAndTrail":
-            lock_exit_time = find_lock_trail_exit_time(
-                idx, day, entry_time, exit_time,
-                legs, expiries, step, lot_size,
-                lock_trigger, lock_floor,
-                lock_trail_for_every, lock_trail_by, spot,
-            )
-        else:
-            lock_exit_time = None
-
-        # ── Resolve: earliest exit wins; SL > TGT > Lock on tie ──────────────
-        overall_sl_exit_time, overall_tgt_exit_time, lock_exit_time, effective_exit = \
-            resolve_all_exits(overall_sl_exit_time, overall_tgt_exit_time, lock_exit_time, exit_time)
-
-        # Which trigger actually caused the effective exit?
-        sl_caused_exit  = (overall_sl_exit_time  is not None and effective_exit == overall_sl_exit_time)
-        tgt_caused_exit = (overall_tgt_exit_time is not None and effective_exit == overall_tgt_exit_time)
-
-        day_trade = {
-            "date":                  day,
-            "entry_time":            entry_time,
-            "exit_time":             effective_exit,
-            "spot_at_entry":         round(spot, 2),
-            "legs":                  [],
-            "total_pnl":             0.0,
-            "overall_sl_exit":       overall_sl_exit_time  is not None,
-            "overall_sl_exit_time":  overall_sl_exit_time,
-            "overall_tgt_exit":      overall_tgt_exit_time is not None,
-            "overall_tgt_exit_time": overall_tgt_exit_time,
-            "lock_exit":             lock_exit_time        is not None,
-            "lock_exit_time":        lock_exit_time,
-        }
-        valid = True
-
-        for leg_num, leg in enumerate(legs, start=1):
-            position     = "SELL" if "Sell" in leg["PositionType"] else "BUY"
-            otype        = "CE"   if "CE"   in leg["InstrumentKind"] else "PE"
-            expiry_kind  = leg.get("ExpiryKind",      "ExpiryType.Weekly")
-            entry_type   = leg.get("EntryType",       "EntryType.EntryByStrikeType")
-            strike_param = leg.get("StrikeParameter", "StrikeType.ATM")
-            lots         = int(leg["LotConfig"]["Value"])
-            sl_type       = leg["LegStopLoss"]["Type"]
-            sl_val        = float(leg["LegStopLoss"]["Value"])
-            tgt_type      = leg["LegTarget"]["Type"]
-            tgt_val       = float(leg["LegTarget"]["Value"])
-            momentum_type = leg.get("LegMomentum", {}).get("Type",  "None")
-            momentum_val  = float(leg.get("LegMomentum", {}).get("Value", 0))
-            trail_sl      = leg.get("LegTrailSL", {})
-            trail_type    = trail_sl.get("Type", "None")
-            trail_x       = float(trail_sl.get("Value", {}).get("InstrumentMove", 0))
-            trail_y       = float(trail_sl.get("Value", {}).get("StopLossMove",   0))
-
-            # Re-entry config
-            re_sl  = leg.get("LegReentrySL", {})
-            re_tp  = leg.get("LegReentryTP", {})
-            reentry_sl_type  = re_sl.get("Type", "None")
-            reentry_tp_type  = re_tp.get("Type", "None")
-            _re_sl_val_cnt = re_sl.get("Value", {})
-            _re_tp_val_cnt = re_tp.get("Value", {})
-            reentry_sl_count = int(_re_sl_val_cnt.get("ReentryCount", 0) if isinstance(_re_sl_val_cnt, dict) else 0) \
-                               if reentry_sl_type != "None" else 0
-            reentry_tp_count = int(_re_tp_val_cnt.get("ReentryCount", 0) if isinstance(_re_tp_val_cnt, dict) else 0) \
-                               if reentry_tp_type != "None" else 0
-            _re_sl_val = re_sl.get("Value", {})
-            _re_tp_val = re_tp.get("Value", {})
-            reentry_sl_next_ref = _re_sl_val.get("NextLegRef") if isinstance(_re_sl_val, dict) else None
-            reentry_tp_next_ref = _re_tp_val.get("NextLegRef") if isinstance(_re_tp_val, dict) else None
-
-            expiry = _resolve_expiry(day, expiry_kind, expiries, expiry_weekday)
-            if expiry is None:
-                valid = False; break
-
-            actual_entry_time  = entry_time
-            override_entry_px  = None
-            override_base_px   = None
-
-            if rb_type != "None":
-                _mode = ("Positional" if is_positional else "BTST" if is_btst else "ORB")
-                tag   = f"[{_mode} {day} leg={leg.get('id')}]"
-
-                if is_positional:
-                    # ── Positional ORB: DTE-based multi-day range ─────────────
-                    if not positional_range_data:
-                        debug_print(f"{tag} SKIP: no range day data")
-                        valid = False; break
-
-                    # Strike at start_dte_day's start_time
-                    start_day_idx = next(
-                        (di for d, di in positional_range_data if d == positional_start_day),
-                        None
-                    )
-                    if start_day_idx is None:
-                        debug_print(f"{tag} SKIP: start_day {positional_start_day} not loaded")
-                        valid = False; break
-
-                    rb_spot = start_day_idx.get_spot(positional_start_day, rb_start) or spot
-                    strike  = _pick_strike(start_day_idx, positional_start_day, rb_start,
-                                           expiry, otype, rb_spot,
-                                           entry_type, strike_param, step)
-                    if strike is None:
-                        debug_print(f"{tag} SKIP: strike not resolved at {rb_start} on {positional_start_day}")
-                        valid = False; break
-
-                    r_high, r_low = compute_positional_range(
-                        positional_range_data, rb_start, rb_end, day,
-                        rb_type, expiry, strike, otype,
-                    )
-
-                elif is_btst:
-                    # ── BTST ORB: strike on Day 1, range spans Day 1 + Day 2 ──
-                    if prev_idx is None:
-                        debug_print(f"{tag} SKIP: no previous day data (day_idx={day_idx})")
-                        valid = False; break
-
-                    rb_spot = prev_idx.get_spot(prev_trading_day, rb_start) or spot
-                    strike  = _pick_strike(prev_idx, prev_trading_day, rb_start,
-                                           expiry, otype, rb_spot,
-                                           entry_type, strike_param, step)
-                    if strike is None:
-                        debug_print(f"{tag} SKIP: strike not resolved at {rb_start} on {prev_trading_day}")
-                        valid = False; break
-
-                    r_high, r_low = compute_btst_range(
-                        prev_idx, idx, prev_trading_day, day,
-                        rb_start, rb_end, rb_type, expiry, strike, otype,
-                    )
-
-                else:
-                    # ── Same-day ORB: strike at range_start on today ──────────
-                    rb_spot = idx.get_spot(day, rb_start) or spot
-                    strike  = _pick_strike(idx, day, rb_start, expiry, otype, rb_spot,
-                                           entry_type, strike_param, step)
-                    if strike is None:
-                        debug_print(f"{tag} SKIP: strike not resolved at {rb_start}")
-                        valid = False; break
-
-                    r_high, r_low = compute_range(
-                        idx, day, rb_start, rb_end,
-                        rb_type, expiry, strike, otype,
-                    )
-
-                if r_high is None or r_low is None:
-                    debug_print(f"{tag} SKIP: no range data")
-                    valid = False; break
-
-                debug_print(f"{tag} range={rb_start}→{rb_end} "
-                      f"high={r_high:.2f} low={r_low:.2f} condition={rb_condition}")
-
-                # Breakout scan always on current trade day
-                rb_entry_time, rb_entry_price = find_breakout_entry(
-                    idx, day, rb_end, effective_exit,
-                    expiry, strike, otype,
-                    rb_type, rb_condition, r_high, r_low,
+            # ── Overall SL: static or trailing ───────────────────────────────────
+            if trail_sl_type != "None" and overall_sl_type != "None":
+                overall_sl_exit_time, overall_sl_exit_date = find_trail_sl_exit_time(
+                    idx, day, entry_time, exit_time,
+                    legs, expiries, step, lot_size,
+                    overall_sl_type, overall_sl_val,
+                    trail_sl_type, trail_sl_for_every, trail_sl_by, spot,
+                    **_btst_kwargs,
                 )
-                if rb_entry_time is None:
-                    debug_print(f"{tag} SKIP: breakout never triggered")
-                    valid = False; break
-
-                debug_print(f"{tag} breakout at {rb_entry_time} entry_px={rb_entry_price:.2f}")
-
-                actual_entry_time = rb_entry_time
-                override_entry_px = rb_entry_price
-
             else:
-                # ── Normal flow: strike at entry_time + optional momentum ─────
-                strike = _pick_strike(idx, day, entry_time, expiry, otype, spot,
-                                      entry_type, strike_param, step)
-                if strike is None:
+                overall_sl_exit_time, overall_sl_exit_date = find_overall_sl_exit_time(
+                    idx, day, entry_time, exit_time,
+                    legs, expiries, step, lot_size,
+                    overall_sl_type, overall_sl_val, spot,
+                    idle_configs=strategy.get("IdleLegConfigs", {}),
+                    **_btst_kwargs,
+                )
+
+            # ── Overall Target ────────────────────────────────────────────────────
+            overall_tgt_exit_time, overall_tgt_exit_date = find_overall_tgt_exit_time(
+                idx, day, entry_time, exit_time,
+                legs, expiries, step, lot_size,
+                overall_tgt_type, overall_tgt_val, spot,
+                idle_configs=strategy.get("IdleLegConfigs", {}),
+                **_btst_kwargs,
+            )
+
+            # ── Lock / Lock and Trail ─────────────────────────────────────────────
+            if lock_type == "Lock":
+                lock_exit_time, lock_exit_date = find_lock_exit_time(
+                    idx, day, entry_time, exit_time,
+                    legs, expiries, step, lot_size,
+                    lock_trigger, lock_floor, spot,
+                    **_btst_kwargs,
+                )
+            elif lock_type == "LockAndTrail":
+                lock_exit_time, lock_exit_date = find_lock_trail_exit_time(
+                    idx, day, entry_time, exit_time,
+                    legs, expiries, step, lot_size,
+                    lock_trigger, lock_floor,
+                    lock_trail_for_every, lock_trail_by, spot,
+                    **_btst_kwargs,
+                )
+            else:
+                lock_exit_time, lock_exit_date = None, None
+
+            # ── Resolve: earliest exit wins; SL > TGT > Lock on tie ──────────────
+            overall_sl_exit_time, overall_tgt_exit_time, lock_exit_time, effective_exit, effective_exit_date = \
+                resolve_all_exits(
+                    overall_sl_exit_time, overall_tgt_exit_time, lock_exit_time, exit_time,
+                    overall_sl_date=overall_sl_exit_date, overall_tgt_date=overall_tgt_exit_date,
+                    lock_exit_date=lock_exit_date, eod_exit_date=_eod_exit_date,
+                )
+
+            # Which trigger actually caused the effective exit?
+            sl_caused_exit  = (overall_sl_exit_time  is not None and effective_exit == overall_sl_exit_time and effective_exit_date == (overall_sl_exit_date or _eod_exit_date))
+            tgt_caused_exit = (overall_tgt_exit_time is not None and effective_exit == overall_tgt_exit_time and effective_exit_date == (overall_tgt_exit_date or _eod_exit_date))
+
+            day_trade = {
+                "date":                  day,
+                "entry_time":            entry_time,
+                "exit_time":             effective_exit,
+                # Only ever differs from "date" for whole-strategy BTST —
+                # every existing (non-BTST) trade keeps exit_date == date.
+                "exit_date":             effective_exit_date,
+                "spot_at_entry":         round(spot, 2),
+                "legs":                  [],
+                "total_pnl":             0.0,
+                "overall_sl_exit":       overall_sl_exit_time  is not None,
+                "overall_sl_exit_time":  overall_sl_exit_time,
+                "overall_tgt_exit":      overall_tgt_exit_time is not None,
+                "overall_tgt_exit_time": overall_tgt_exit_time,
+                "lock_exit":             lock_exit_time        is not None,
+                "lock_exit_time":        lock_exit_time,
+            }
+            valid = True
+
+            for leg_num, leg in enumerate(legs, start=1):
+                position     = "SELL" if "Sell" in leg["PositionType"] else "BUY"
+                otype        = "CE"   if "CE"   in leg["InstrumentKind"] else "PE"
+                expiry_kind  = leg.get("ExpiryKind",      "ExpiryType.Weekly")
+                entry_type   = leg.get("EntryType",       "EntryType.EntryByStrikeType")
+                strike_param = leg.get("StrikeParameter", "StrikeType.ATM")
+                lots         = int(leg["LotConfig"]["Value"])
+                sl_type       = leg["LegStopLoss"]["Type"]
+                sl_val        = float(leg["LegStopLoss"]["Value"])
+                tgt_type      = leg["LegTarget"]["Type"]
+                tgt_val       = float(leg["LegTarget"]["Value"])
+                momentum_type = leg.get("LegMomentum", {}).get("Type",  "None")
+                momentum_val  = float(leg.get("LegMomentum", {}).get("Value", 0))
+                trail_sl      = leg.get("LegTrailSL", {})
+                trail_type    = trail_sl.get("Type", "None")
+                trail_x       = float(trail_sl.get("Value", {}).get("InstrumentMove", 0))
+                trail_y       = float(trail_sl.get("Value", {}).get("StopLossMove",   0))
+
+                # Re-entry config
+                re_sl  = leg.get("LegReentrySL", {})
+                re_tp  = leg.get("LegReentryTP", {})
+                reentry_sl_type  = re_sl.get("Type", "None")
+                reentry_tp_type  = re_tp.get("Type", "None")
+                _re_sl_val_cnt = re_sl.get("Value", {})
+                _re_tp_val_cnt = re_tp.get("Value", {})
+                reentry_sl_count = int(_re_sl_val_cnt.get("ReentryCount", 0) if isinstance(_re_sl_val_cnt, dict) else 0) \
+                                   if reentry_sl_type != "None" else 0
+                reentry_tp_count = int(_re_tp_val_cnt.get("ReentryCount", 0) if isinstance(_re_tp_val_cnt, dict) else 0) \
+                                   if reentry_tp_type != "None" else 0
+                _re_sl_val = re_sl.get("Value", {})
+                _re_tp_val = re_tp.get("Value", {})
+                reentry_sl_next_ref = _re_sl_val.get("NextLegRef") if isinstance(_re_sl_val, dict) else None
+                reentry_tp_next_ref = _re_tp_val.get("NextLegRef") if isinstance(_re_tp_val, dict) else None
+
+                expiry = _resolve_expiry(day, expiry_kind, expiries, expiry_weekday)
+                if expiry is None:
                     valid = False; break
 
-                if momentum_type != "None" and momentum_val > 0:
-                    if "Underlying" in momentum_type:
-                        base_px = idx.get_spot(day, entry_time)
+                actual_entry_time  = entry_time
+                override_entry_px  = None
+                override_base_px   = None
+
+                # Positional ORB stays strategy-level (DTE-anchored, applies
+                # uniformly to every leg) — untouched. Instrument/Underlying/
+                # BTSTInstrument/BTSTUnderlying are now per-leg: each leg's
+                # own LegRangeBreakout config decides independently whether
+                # (and how) it range-breaks-out, matching the real AlgoTest
+                # feature (each option leg tracks its own premium/spot and
+                # enters on its own breakout, not a shared strategy signal).
+                # Signal-driven runs skip Positional ORB entirely (see
+                # is_signal_driven above) — the window's own entry/exit IS
+                # the signal, so it falls through to per-leg config, which
+                # for a plain Positional strategy without its own separate
+                # per-leg range breakout will just be "None" (normal flow).
+                use_positional_rb = is_positional and not is_signal_driven
+                leg_rb_type, leg_rb_condition, leg_rb_start, leg_rb_end = (
+                    (rb_type, rb_condition, rb_start, rb_end) if use_positional_rb
+                    else parse_leg_range_breakout(leg)
+                )
+                leg_is_btst = (not use_positional_rb) and "BTST" in leg_rb_type
+
+                if leg_rb_type != "None":
+                    _mode = ("Positional" if use_positional_rb else "BTST" if leg_is_btst else "ORB")
+                    tag   = f"[{_mode} {day} leg={leg.get('id')}]"
+
+                    if use_positional_rb:
+                        # ── Positional ORB: DTE-based multi-day range ─────────────
+                        if not positional_range_data:
+                            debug_print(f"{tag} SKIP: no range day data")
+                            valid = False; break
+
+                        # Strike at start_dte_day's start_time
+                        start_day_idx = next(
+                            (di for d, di in positional_range_data if d == positional_start_day),
+                            None
+                        )
+                        if start_day_idx is None:
+                            debug_print(f"{tag} SKIP: start_day {positional_start_day} not loaded")
+                            valid = False; break
+
+                        rb_spot = start_day_idx.get_spot(positional_start_day, leg_rb_start) or spot
+                        strike  = _pick_strike(start_day_idx, positional_start_day, leg_rb_start,
+                                               expiry, otype, rb_spot,
+                                               entry_type, strike_param, step)
+                        if strike is None:
+                            debug_print(f"{tag} SKIP: strike not resolved at {leg_rb_start} on {positional_start_day}")
+                            valid = False; break
+
+                        r_high, r_low = compute_positional_range(
+                            positional_range_data, leg_rb_start, leg_rb_end, day,
+                            leg_rb_type, expiry, strike, otype,
+                        )
+
+                    elif leg_is_btst:
+                        # ── BTST ORB: strike on Day 1, range spans Day 1 + Day 2 ──
+                        if prev_idx is None:
+                            debug_print(f"{tag} SKIP: no previous day data (day_idx={day_idx})")
+                            valid = False; break
+
+                        rb_spot = prev_idx.get_spot(prev_trading_day, leg_rb_start) or spot
+                        strike  = _pick_strike(prev_idx, prev_trading_day, leg_rb_start,
+                                               expiry, otype, rb_spot,
+                                               entry_type, strike_param, step)
+                        if strike is None:
+                            debug_print(f"{tag} SKIP: strike not resolved at {leg_rb_start} on {prev_trading_day}")
+                            valid = False; break
+
+                        r_high, r_low = compute_btst_range(
+                            prev_idx, idx, prev_trading_day, day,
+                            leg_rb_start, leg_rb_end, leg_rb_type, expiry, strike, otype,
+                        )
+
                     else:
-                        base_px = idx.get_close(day, entry_time, expiry, strike, otype)
-                    if base_px is None:
+                        # ── Same-day ORB: strike at range_start on today ──────────
+                        rb_spot = idx.get_spot(day, leg_rb_start) or spot
+                        strike  = _pick_strike(idx, day, leg_rb_start, expiry, otype, rb_spot,
+                                               entry_type, strike_param, step)
+                        if strike is None:
+                            debug_print(f"{tag} SKIP: strike not resolved at {leg_rb_start}")
+                            valid = False; break
+
+                        r_high, r_low = compute_range(
+                            idx, day, leg_rb_start, leg_rb_end,
+                            leg_rb_type, expiry, strike, otype,
+                        )
+
+                    if r_high is None or r_low is None:
+                        debug_print(f"{tag} SKIP: no range data")
                         valid = False; break
 
-                    mom_time, mom_px = _find_momentum_entry(
-                        idx, day, _add_one_minute(entry_time), exit_time,
+                    debug_print(f"{tag} range={leg_rb_start}→{leg_rb_end} "
+                          f"high={r_high:.2f} low={r_low:.2f} condition={leg_rb_condition}")
+
+                    # Breakout scan always on current trade day
+                    rb_entry_time, rb_entry_price = find_breakout_entry(
+                        idx, day, leg_rb_end, effective_exit,
                         expiry, strike, otype,
-                        base_px, momentum_type, momentum_val,
+                        leg_rb_type, leg_rb_condition, r_high, r_low,
                     )
-                    if mom_time is None:
-                        valid = False; break   # momentum not achieved → no trade today
-
-                    actual_entry_time = mom_time
-                    override_entry_px = mom_px
-                    override_base_px  = base_px
-                else:
-                    if idx.get_close(day, entry_time, expiry, strike, otype) is None:
+                    if rb_entry_time is None:
+                        debug_print(f"{tag} SKIP: breakout never triggered")
                         valid = False; break
 
-            # Process leg (with re-entry support)
-            result = _process_leg(
-                idx, day, actual_entry_time, effective_exit,
-                expiry, strike, otype, position,
-                sl_type, sl_val, tgt_type, tgt_val,
-                reentry_sl_count, reentry_tp_count,
-                reentry_sl_type, reentry_tp_type,
-                lots, lot_size,
-                entry_type, strike_param, step,
-                momentum_type, momentum_val,
-                override_entry_px=override_entry_px,
-                override_base_px=override_base_px,
-                strategy_entry_time=entry_time,
-                trail_type=trail_type, trail_x=trail_x, trail_y=trail_y,
-                reentry_sl_next_ref=reentry_sl_next_ref,
-                reentry_tp_next_ref=reentry_tp_next_ref,
-            )
+                    debug_print(f"{tag} breakout at {rb_entry_time} entry_px={rb_entry_price:.2f}")
 
-            for st in result["sub_trades"]:
-                st["parent_leg_num"]  = leg_num
-                st["parent_leg_type"] = otype
+                    actual_entry_time = rb_entry_time
+                    override_entry_px = rb_entry_price
 
-            parent_leg_entry = {
-                "id":                leg["id"],
-                "expiry":            expiry,
-                "strike":            strike,
-                "type":              otype,
-                "position":          position,
-                "entry_time":        result["entry_time"],
-                "entry_price":       result["entry_price"],
-                "exit_time":         result["exit_time"],
-                "exit_price":        result["exit_price"],
-                "exit_reason":       result["exit_reason"],
-                "reentries":         result["reentries"],
-                "lots":              lots,
-                "lot_size":          lot_size,
-                "pnl":               result["total_leg_pnl"],
-                "sub_trades":        result["sub_trades"],
-                "range_breakout":    rb_type != "None",
-                "leg_num":           leg_num,
-            }
+                else:
+                    # ── Normal flow: strike at entry_time + optional momentum ─────
+                    strike = _pick_strike(idx, day, entry_time, expiry, otype, spot,
+                                          entry_type, strike_param, step)
+                    if strike is None:
+                        valid = False; break
 
-            # ── Lazy Leg: merge into parent leg's sub_trades ──────────────────
-            idle_configs = strategy.get("IdleLegConfigs", {})
-            debug_print(f"[Leg {leg['id']} {day}] exit_reason={result['exit_reason']} next_leg_ref={result.get('next_leg_ref')} trigger_time={result.get('next_leg_trigger_time')}")
-            if idle_configs and result.get("next_leg_ref"):
-                lazy_legs = process_lazy_legs(
-                    idx, day, effective_exit, expiries,
-                    result["next_leg_ref"],
-                    result["next_leg_trigger_time"],
-                    idle_configs, lot_size, step,
+                    if momentum_type != "None" and momentum_val > 0:
+                        if "Underlying" in momentum_type:
+                            base_px = idx.get_spot(day, entry_time)
+                        else:
+                            base_px = idx.get_close(day, entry_time, expiry, strike, otype)
+                        if base_px is None:
+                            valid = False; break
+
+                        mom_time, mom_px = _find_momentum_entry(
+                            idx, day, _add_one_minute(entry_time), exit_time,
+                            expiry, strike, otype,
+                            base_px, momentum_type, momentum_val,
+                        )
+                        if mom_time is None:
+                            valid = False; break   # momentum not achieved → no trade today
+
+                        actual_entry_time = mom_time
+                        override_entry_px = mom_px
+                        override_base_px  = base_px
+                    else:
+                        if idx.get_close(day, entry_time, expiry, strike, otype) is None:
+                            valid = False; break
+
+                # Process leg (with re-entry support)
+                # Only let this leg's own scan roll into Day 2 if the
+                # already-resolved effective_exit itself landed on Day 2 —
+                # if an Overall SL/Target/Lock forced an earlier exit on
+                # Day 1, the leg must NOT continue past that, so next_idx
+                # is withheld and _process_leg behaves exactly as the
+                # existing (non-BTST) single-day path.
+                _leg_rolls_to_day2 = is_whole_strategy_btst and effective_exit_date == next_day
+                result = _process_leg(
+                    idx, day, actual_entry_time, effective_exit,
+                    expiry, strike, otype, position,
+                    sl_type, sl_val, tgt_type, tgt_val,
+                    reentry_sl_count, reentry_tp_count,
+                    reentry_sl_type, reentry_tp_type,
+                    lots, lot_size,
+                    entry_type, strike_param, step,
+                    momentum_type, momentum_val,
+                    override_entry_px=override_entry_px,
+                    override_base_px=override_base_px,
+                    strategy_entry_time=entry_time,
+                    trail_type=trail_type, trail_x=trail_x, trail_y=trail_y,
+                    reentry_sl_next_ref=reentry_sl_next_ref,
+                    reentry_tp_next_ref=reentry_tp_next_ref,
+                    next_idx=next_idx if _leg_rolls_to_day2 else None,
+                    next_day=next_day if _leg_rolls_to_day2 else None,
+                    next_exit_time=effective_exit if _leg_rolls_to_day2 else None,
+                    # Only a signal-driven, plain-intraday, non-BTST window
+                    # skips a stale (entry_time >= exit_time) leg outright —
+                    # every non-signal-driven backtest (the normal algo.trade
+                    # fixed-time flow) always passes False here, so that
+                    # path's behavior is completely unchanged. Positional
+                    # Range Breakout and whole-strategy BTST are excluded
+                    # too: BTST in particular is the one real multi-day-carry
+                    # case this engine has today — a Day-1 entry_time like
+                    # "15:25" can legitimately be lexically >= a Day-2
+                    # exit_time like "15:15" (different days, same "HH:MM"
+                    # string space) without actually being stale.
+                    skip_stale_entry=is_signal_driven and not is_positional and not is_whole_strategy_btst,
                 )
-                for ll in lazy_legs:
-                    # tag each sub_trade with lazy leg id and add to parent
-                    for st in ll.get("sub_trades", []):
-                        st["lazy_leg_id"]  = ll["id"]
-                        st["parent_leg_num"]  = leg_num
-                        st["parent_leg_type"] = otype
-                        # preserve inner reentry_number; prefix type with Lazy(id)
-                        inner_type = st.get("reentry_type", "Initial")
-                        st["reentry_type"] = f"Lazy({ll['id']})" if inner_type == "Initial" else f"Lazy({ll['id']})/{inner_type}"
-                        parent_leg_entry["sub_trades"].append(st)
-                    # merge lazy leg pnl into parent leg pnl
-                    parent_leg_entry["pnl"] = round(
-                        parent_leg_entry["pnl"] + ll["pnl"], 2
+
+                for st in result["sub_trades"]:
+                    st["parent_leg_num"]  = leg_num
+                    st["parent_leg_type"] = otype
+
+                parent_leg_entry = {
+                    "id":                leg.get("id", leg_num),
+                    "expiry":            expiry,
+                    "strike":            strike,
+                    "type":              otype,
+                    "position":          position,
+                    "entry_time":        result["entry_time"],
+                    "entry_price":       result["entry_price"],
+                    "exit_time":         result["exit_time"],
+                    "exit_price":        result["exit_price"],
+                    "exit_reason":       result["exit_reason"],
+                    "reentries":         result["reentries"],
+                    "lots":              lots,
+                    "lot_size":          lot_size,
+                    "pnl":               result["total_leg_pnl"],
+                    "sub_trades":        result["sub_trades"],
+                    "range_breakout":    rb_type != "None",
+                    "leg_num":           leg_num,
+                }
+
+                # ── Lazy Leg: merge into parent leg's sub_trades ──────────────────
+                idle_configs = strategy.get("IdleLegConfigs", {})
+                debug_print(f"[Leg {leg.get('id', leg_num)} {day}] exit_reason={result['exit_reason']} next_leg_ref={result.get('next_leg_ref')} trigger_time={result.get('next_leg_trigger_time')}")
+                if idle_configs and result.get("next_leg_ref"):
+                    lazy_legs = process_lazy_legs(
+                        idx, day, effective_exit, expiries,
+                        result["next_leg_ref"],
+                        result["next_leg_trigger_time"],
+                        idle_configs, lot_size, step,
                     )
-                    # extend exit_time to lazy leg's exit if later
-                    if ll["exit_time"] and ll["exit_time"] > parent_leg_entry["exit_time"]:
-                        parent_leg_entry["exit_time"] = ll["exit_time"]
-                        parent_leg_entry["exit_price"] = ll["exit_price"]
-                        parent_leg_entry["exit_reason"] = ll["exit_reason"]
+                    for ll in lazy_legs:
+                        # tag each sub_trade with lazy leg id and add to parent
+                        for st in ll.get("sub_trades", []):
+                            st["lazy_leg_id"]  = ll["id"]
+                            st["parent_leg_num"]  = leg_num
+                            st["parent_leg_type"] = otype
+                            # preserve inner reentry_number; prefix type with Lazy(id)
+                            inner_type = st.get("reentry_type", "Initial")
+                            st["reentry_type"] = f"Lazy({ll['id']})" if inner_type == "Initial" else f"Lazy({ll['id']})/{inner_type}"
+                            parent_leg_entry["sub_trades"].append(st)
+                        # merge lazy leg pnl into parent leg pnl
+                        parent_leg_entry["pnl"] = round(
+                            parent_leg_entry["pnl"] + ll["pnl"], 2
+                        )
+                        # extend exit_time to lazy leg's exit if later
+                        if ll["exit_time"] and ll["exit_time"] > parent_leg_entry["exit_time"]:
+                            parent_leg_entry["exit_time"] = ll["exit_time"]
+                            parent_leg_entry["exit_price"] = ll["exit_price"]
+                            parent_leg_entry["exit_reason"] = ll["exit_reason"]
 
-            day_trade["legs"].append(parent_leg_entry)
+                # Signal-driven only: a leg with zero sub_trades here means
+                # skip_stale_entry fired above (a stale/mismatched signal
+                # window) — drop it instead of logging a phantom zero-PnL
+                # row. Checked after the Lazy Leg merge, not on
+                # result["sub_trades"] directly, since a NextLeg trigger can
+                # still populate parent_leg_entry["sub_trades"] from its lazy
+                # leg even when this leg's own result["sub_trades"] was
+                # empty. The normal (non-signal-driven) algo.trade flow
+                # always appends, exactly as before — untouched.
+                if is_signal_driven and not parent_leg_entry["sub_trades"]:
+                    pass
+                else:
+                    day_trade["legs"].append(parent_leg_entry)
 
-        if valid and day_trade["legs"]:
-            day_trade["total_pnl"] = round(sum(l["pnl"] for l in day_trade["legs"]), 2)
+            if valid and day_trade["legs"]:
+                day_trade["total_pnl"] = round(sum(l["pnl"] for l in day_trade["legs"]), 2)
 
-            # ── Tag sub_trades cut off by overall SL / overall Target ─────────
-            if sl_caused_exit and overall_sl_exit_time:
-                for leg in day_trade["legs"]:
-                    for st in leg.get("sub_trades", []):
-                        if st.get("exit_time") == overall_sl_exit_time and st.get("exit_reason") == "Time Exit":
-                            st["exit_reason"] = "Overall SL"
-                    if leg.get("exit_time") == overall_sl_exit_time and leg.get("exit_reason") == "Time Exit":
-                        leg["exit_reason"] = "Overall SL"
+                # ── Tag sub_trades cut off by overall SL / overall Target ─────────
+                if sl_caused_exit and overall_sl_exit_time:
+                    for leg in day_trade["legs"]:
+                        for st in leg.get("sub_trades", []):
+                            if st.get("exit_time") == overall_sl_exit_time and st.get("exit_reason") == "Time Exit":
+                                st["exit_reason"] = "Overall SL"
+                        if leg.get("exit_time") == overall_sl_exit_time and leg.get("exit_reason") == "Time Exit":
+                            leg["exit_reason"] = "Overall SL"
 
-            if tgt_caused_exit and overall_tgt_exit_time:
-                for leg in day_trade["legs"]:
-                    for st in leg.get("sub_trades", []):
-                        if st.get("exit_time") == overall_tgt_exit_time and st.get("exit_reason") == "Time Exit":
-                            st["exit_reason"] = "Overall Target"
-                    if leg.get("exit_time") == overall_tgt_exit_time and leg.get("exit_reason") == "Time Exit":
-                        leg["exit_reason"] = "Overall Target"
+                if tgt_caused_exit and overall_tgt_exit_time:
+                    for leg in day_trade["legs"]:
+                        for st in leg.get("sub_trades", []):
+                            if st.get("exit_time") == overall_tgt_exit_time and st.get("exit_reason") == "Time Exit":
+                                st["exit_reason"] = "Overall Target"
+                        if leg.get("exit_time") == overall_tgt_exit_time and leg.get("exit_reason") == "Time Exit":
+                            leg["exit_reason"] = "Overall Target"
 
-            # ── Overall Re-entry on SL ────────────────────────────────────────
-            if (sl_caused_exit and
-                    overall_re_type != "None" and
-                    overall_re_count > 0 and
-                    overall_sl_exit_time < exit_time):
+                # ── Overall Re-entry on SL ────────────────────────────────────────
+                if (sl_caused_exit and
+                        overall_re_type != "None" and
+                        overall_re_count > 0 and
+                        overall_sl_exit_time < exit_time):
 
-                reentry_legs = run_overall_reentry(
-                    idx           = idx,
-                    day           = day,
-                    trigger_time  = overall_sl_exit_time,
-                    exit_time     = exit_time,
-                    leg_configs   = legs,
-                    expiries      = expiries,
-                    step          = step,
-                    lot_size      = lot_size,
-                    idle_configs  = strategy.get("IdleLegConfigs", {}),
-                    overall_sl_type  = overall_sl_type,
-                    overall_sl_val   = overall_sl_val,
-                    overall_tgt_type = overall_tgt_type,
-                    overall_tgt_val  = overall_tgt_val,
-                    reentry_type   = overall_re_type,
-                    reentries_left = overall_re_count,
-                    cycle_number  = 1,
-                    base_pnl_before_cycle = day_trade["total_pnl"],
-                )
+                    reentry_legs = run_overall_reentry(
+                        idx           = idx,
+                        day           = day,
+                        trigger_time  = overall_sl_exit_time,
+                        exit_time     = exit_time,
+                        leg_configs   = legs,
+                        expiries      = expiries,
+                        step          = step,
+                        lot_size      = lot_size,
+                        idle_configs  = strategy.get("IdleLegConfigs", {}),
+                        overall_sl_type  = overall_sl_type,
+                        overall_sl_val   = overall_sl_val,
+                        overall_tgt_type = overall_tgt_type,
+                        overall_tgt_val  = overall_tgt_val,
+                        reentry_type   = overall_re_type,
+                        reentries_left = overall_re_count,
+                        cycle_number  = 1,
+                        base_pnl_before_cycle = day_trade["total_pnl"],
+                    )
 
-                _merge_reentry_into_parents(day_trade["legs"], reentry_legs)
-                day_trade["total_pnl"] = round(
-                    sum(l["pnl"] for l in day_trade["legs"]), 2
-                )
+                    _merge_reentry_into_parents(day_trade["legs"], reentry_legs)
+                    day_trade["total_pnl"] = round(
+                        sum(l["pnl"] for l in day_trade["legs"]), 2
+                    )
 
-            # ── Overall Re-entry on Target ────────────────────────────────────
-            if (tgt_caused_exit and
-                    overall_re_tgt_type != "None" and
-                    overall_re_tgt_count > 0 and
-                    overall_tgt_exit_time < exit_time):
+                # ── Overall Re-entry on Target ────────────────────────────────────
+                if (tgt_caused_exit and
+                        overall_re_tgt_type != "None" and
+                        overall_re_tgt_count > 0 and
+                        overall_tgt_exit_time < exit_time):
 
-                tgt_reentry_legs = run_overall_reentry_tgt(
-                    idx              = idx,
-                    day              = day,
-                    trigger_time     = overall_tgt_exit_time,
-                    exit_time        = exit_time,
-                    leg_configs      = legs,
-                    expiries         = expiries,
-                    step             = step,
-                    lot_size         = lot_size,
-                    idle_configs     = strategy.get("IdleLegConfigs", {}),
-                    overall_sl_type  = overall_sl_type,
-                    overall_sl_val   = overall_sl_val,
-                    overall_tgt_type = overall_tgt_type,
-                    overall_tgt_val  = overall_tgt_val,
-                    reentry_type     = overall_re_tgt_type,
-                    reentries_left   = overall_re_tgt_count,
-                    cycle_number     = 1,
-                    base_pnl_before_cycle = day_trade["total_pnl"],
-                )
+                    tgt_reentry_legs = run_overall_reentry_tgt(
+                        idx              = idx,
+                        day              = day,
+                        trigger_time     = overall_tgt_exit_time,
+                        exit_time        = exit_time,
+                        leg_configs      = legs,
+                        expiries         = expiries,
+                        step             = step,
+                        lot_size         = lot_size,
+                        idle_configs     = strategy.get("IdleLegConfigs", {}),
+                        overall_sl_type  = overall_sl_type,
+                        overall_sl_val   = overall_sl_val,
+                        overall_tgt_type = overall_tgt_type,
+                        overall_tgt_val  = overall_tgt_val,
+                        reentry_type     = overall_re_tgt_type,
+                        reentries_left   = overall_re_tgt_count,
+                        cycle_number     = 1,
+                        base_pnl_before_cycle = day_trade["total_pnl"],
+                    )
 
-                _merge_reentry_into_parents(day_trade["legs"], tgt_reentry_legs)
-                day_trade["total_pnl"] = round(
-                    sum(l["pnl"] for l in day_trade["legs"]), 2
-                )
+                    _merge_reentry_into_parents(day_trade["legs"], tgt_reentry_legs)
+                    day_trade["total_pnl"] = round(
+                        sum(l["pnl"] for l in day_trade["legs"]), 2
+                    )
 
-            minute_pnl = _build_minute_pnl_timeline(day_trade, idx, day)
-            _compute_combined_mtm(day_trade, idx, day)
-            explanation_events = _build_trade_explanation(day_trade, idx, day)
-            day_trade["trade_explanation"] = explanation_events
-            day_trade["trade_explanation_content"] = _build_trade_explanation_content(
-                day_trade, explanation_events, strategy.get("IdleLegConfigs", {}),
-                overall_sl_type=overall_sl_type, overall_sl_val=overall_sl_val,
-                overall_tgt_type=overall_tgt_type, overall_tgt_val=overall_tgt_val,
-            )
-            day_trade["trade_explanation_content"]["minute_pnl"] = minute_pnl
-            day_trade = _apply_response_flags(day_trade)
-            trades.append(day_trade)
+                # trade_explanation_content is currently switched off (see
+                # RETURN_TRADE_EXPLANATION_CONTENT) — 30 strategies x 5 years was
+                # projected at ~200MB with it on, and _compute_combined_mtm +
+                # _build_trade_explanation + _build_trade_explanation_content is
+                # real per-day compute, not just response bytes, so skip the whole
+                # chain rather than building it and throwing it away in
+                # _apply_response_flags. Neither its per-sub_trade output fields nor
+                # a full minute-by-minute timeline are read by the frontend
+                # (Portfolio.tsx/Strategy.tsx audited: only
+                # trade_explanation_content.steps[].combined_mtm/combined_mtm_breakdown
+                # and top-level date/legs/sub_trades entry-exit fields are used).
+                if RETURN_TRADE_EXPLANATION_CONTENT or RETURN_TRADE_EXPLANATION:
+                    _compute_combined_mtm(day_trade, idx, day)
+                    explanation_events = _build_trade_explanation(day_trade, idx, day)
+                    day_trade["trade_explanation_content"] = _build_trade_explanation_content(
+                        day_trade, explanation_events, strategy.get("IdleLegConfigs", {}),
+                        overall_sl_type=overall_sl_type, overall_sl_val=overall_sl_val,
+                        overall_tgt_type=overall_tgt_type, overall_tgt_val=overall_tgt_val,
+                    )
+                    for leg in day_trade.get("legs", []):
+                        for st in leg.get("sub_trades", []):
+                            st.pop("combined_mtm_at_entry", None)
+                            st.pop("combined_mtm_breakdown_at_entry", None)
+                            st.pop("combined_mtm_at_exit", None)
+                            st.pop("combined_mtm_breakdown_at_exit", None)
+                day_trade = _apply_response_flags(day_trade)
+                trades.append(day_trade)
 
         if on_progress:
             on_progress(day_idx + 1, total_steps,
                         f"Processing {day_idx + 1}/{total_days}: {day}")
 
     db.close()
+
+    _t_end = time.perf_counter()
+    _loop_elapsed     = _t_end - _t_prewarm
+    _data_load_total  = (_TIMING_STATS["redis_time"] + _TIMING_STATS["pkl5_time"]
+                          + _TIMING_STATS["parquet_cold_time"] + _TIMING_STATS["mongo_cold_time"])
+    print(
+        f"[BACKTEST TIMING] total={_t_end - _t_start:.2f}s "
+        f"metadata={_t_metadata - _t_start:.2f}s "
+        f"prewarm={_t_prewarm - _t_metadata:.2f}s "
+        f"main_loop={_loop_elapsed:.2f}s "
+        f"(data_load={_data_load_total:.2f}s strategy_sim={_loop_elapsed - _data_load_total:.2f}s) | "
+        f"redis: {_TIMING_STATS['redis_hits']} hits / {_TIMING_STATS['redis_time']:.2f}s | "
+        f"pkl5: {_TIMING_STATS['pkl5_hits']} hits / {_TIMING_STATS['pkl5_time']:.2f}s | "
+        f"parquet_cold: {_TIMING_STATS['parquet_cold_hits']} hits / {_TIMING_STATS['parquet_cold_time']:.2f}s | "
+        f"mongo_cold: {_TIMING_STATS['mongo_cold_hits']} hits / {_TIMING_STATS['mongo_cold_time']:.2f}s | "
+        f"days={len(trading_days)} trades={len(trades)}"
+    )
 
     return {
         "trades":  trades,
@@ -2784,7 +3338,18 @@ def run_backtest(request: dict, on_progress=None) -> dict:
     }
 
 
-if __name__ == "__main__":
+if __name__ == "__main__" and len(sys.argv) >= 3 and sys.argv[1] == "--prewarm":
+    # Worker entry point spawned by _prewarm_parquet_cache via subprocess.Popen:
+    #   python backtest_engine.py --prewarm <underlying> <date1> <date2> ...
+    _underlying = sys.argv[2]
+    for _date in sys.argv[3:]:
+        try:
+            _idx = _load_index_from_parquet_store(_underlying, _date)
+            if _idx is not None:
+                _save_pkl5(_idx, _pkl5_path(_underlying, _date))
+        except Exception:
+            pass
+elif __name__ == "__main__":
     import json, pathlib
     req_path = pathlib.Path(__file__).parent.parent / "current_backtest_request.json"
     with open(req_path) as f:

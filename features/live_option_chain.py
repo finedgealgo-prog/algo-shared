@@ -193,10 +193,20 @@ def _atm_from_spot(spot: float, underlying: str) -> int:
 
 
 def _find_atm_row(rows: list[dict], atm_strike: float) -> dict:
-    """Return the row whose strike is closest to atm_strike."""
+    """Return the row whose strike is closest to atm_strike.
+
+    Prefers rows with a resolved (non-zero) LTP — the literal nearest-strike
+    token can briefly come back unpriced (Dhan REST rate-gate miss, WS not
+    yet ticked, stale >5min tick), and picking it anyway wrongly zeroes/
+    deflates the straddle for PremiumCloseToStraddle / StraddlePrice /
+    SyntheticFuture strike selection. Falls back to the full pool if no row
+    has a valid LTP at all (matches _row_for_strike's pattern below).
+    """
     if not rows:
         return {}
-    return min(rows, key=lambda r: abs(_safe_float(r.get('strike')) - atm_strike))
+    valid = [r for r in rows if _safe_float(r.get('ltp')) > 0]
+    pool = valid if valid else rows
+    return min(pool, key=lambda r: abs(_safe_float(r.get('strike')) - atm_strike))
 
 
 def _get_kite_rest_client(db) -> Any | None:
@@ -721,9 +731,14 @@ def _fetch_full_chain_from_kite(
         if not stk or not tok:
             continue
         quote = token_to_quote.get(tok) or {}
+        # last_price==0 means this strike hasn't traded (yet) this session —
+        # do NOT fall back to ohlc.close (yesterday's close): for options,
+        # premium decays/moves enough day-to-day that using it as a stand-in
+        # LTP silently feeds a stale, usually-inflated price into straddle/
+        # premium strike-selection math and real order entry. Leave ltp=0 so
+        # downstream selectors treat this strike as unpriced, same as the
+        # Dhan chain path already does.
         ltp = _safe_float(quote.get('last_price'))
-        if ltp == 0:
-            ltp = _safe_float((quote.get('ohlc') or {}).get('close'))
         oi = int(quote.get('oi') or 0)
         vol = int(quote.get('volume') or 0)
         row = {

@@ -3725,6 +3725,64 @@ def process_pending_entries(
     return entries_executed
 
 
+def queue_leg_range_breakout_entry(db, cycle_doc: dict, now_ts: str) -> bool:
+    """
+    Called by leg_range_monitor.py the instant a per-leg BTST Range
+    Breakout cycle (see algo_leg_range_cycles) detects its breakout
+    condition for that leg.
+
+    Never touches the broker directly and never builds an order — same
+    rule as every other entry path in this codebase. Instead, delegates to
+    execution_socket._queue_pending_entry_feature_status(), the exact
+    function that already handles no-momentum lazy legs, OverallReentry
+    legs, etc.: it inserts one algo_leg_feature_status row with
+    feature='pending_entry' for this leg (idempotent — its own internal
+    lock + find_one-then-insert guard already prevents duplicate queuing
+    for the same trade_id/leg_id, so this function does not need its own
+    idempotency check). The already-running
+    execution_socket._process_momentum_pending_feature_legs() picks it up
+    on its next tick and enters through the exact same, already-proven
+    order path every other live leg uses. Zero duplicated order-placement
+    or contract-resolution logic — that function already resolves
+    strike/expiry/token/symbol live via _build_live_pending_entry_snapshot.
+
+    Returns True if a new pending_entry row was queued, False if one
+    already existed (already queued or already entered) or the trade/leg
+    could not be resolved.
+    """
+    # Local import: execution_socket imports trading_core at module load,
+    # so importing at module scope here would be circular — same pattern
+    # already used elsewhere in this file (see other
+    # "from features.execution_socket import ..." call sites).
+    from features.execution_socket import _queue_pending_entry_feature_status  # type: ignore
+
+    trade_id = str(cycle_doc.get('trade_id') or '')
+    leg_id = str(cycle_doc.get('leg_id') or '')
+    if not trade_id or not leg_id:
+        return False
+
+    trade = db._db[COL_ALGO_TRADES].find_one({'_id': trade_id})
+    if not trade:
+        log.warning('[LEG RANGE ENTRY] trade=%s not found — cannot queue leg=%s', trade_id, leg_id)
+        return False
+
+    leg_configs = resolve_trade_leg_configs(trade)
+    leg_config = leg_configs.get(leg_id)
+    if not leg_config:
+        log.warning('[LEG RANGE ENTRY] leg=%s not found in trade=%s config', leg_id, trade_id)
+        return False
+
+    queued = _queue_pending_entry_feature_status(
+        db, trade, leg_id, leg_config,
+        leg_type=str(leg_config.get('id') or leg_id),
+        now_ts=now_ts,
+        is_lazy=False,
+    )
+    if queued:
+        print(f'[LEG RANGE ENTRY] trade={trade_id} leg={leg_id} pending_entry queued now_ts={now_ts}')
+    return queued
+
+
 # ──────────────────────────────────────────────────────────────────────────────
 # §18  BROKER TICK PROCESSOR  — live trade & fast-forward via broker WebSocket
 # ──────────────────────────────────────────────────────────────────────────────

@@ -58,10 +58,10 @@ def _ema(values: list[float], length: int) -> list[float | None]:
     return out
 
 
-def compute_supertrend_trend(bars: list[Bar], length: int = 10, factor: float = 3.0) -> list[int]:
+def _supertrend_bands(bars: list[Bar], length: int, factor: float) -> tuple[list[float], list[float], list[int]]:
     n = len(bars)
     if n == 0:
-        return []
+        return [], [], []
 
     highs = [float(b["high"]) for b in bars]
     lows = [float(b["low"]) for b in bars]
@@ -101,7 +101,23 @@ def compute_supertrend_trend(bars: list[Bar], length: int = 10, factor: float = 
         else:
             trend[i] = trend[i - 1]
 
+    return up, dn, trend
+
+
+def compute_supertrend_trend(bars: list[Bar], length: int = 10, factor: float = 3.0) -> list[int]:
+    _up, _dn, trend = _supertrend_bands(bars, length, factor)
     return trend
+
+
+def compute_supertrend_line(bars: list[Bar], length: int = 10, factor: float = 3.0) -> list[float]:
+    """The plotted Supertrend line value itself (the 'up' band while
+    trending up, the 'dn' band while trending down) — mirrors algo-admin's
+    computeSupertrendLine, needed when a condition compares price/another
+    indicator directly against Supertrend's value rather than its flip
+    (see condition_engine.py's live port of Chart.tsx's
+    resolveSignalOperandSeries)."""
+    up, dn, trend = _supertrend_bands(bars, length, factor)
+    return [dn[i] if trend[i] == -1 else up[i] for i in range(len(bars))]
 
 
 def compute_macd(

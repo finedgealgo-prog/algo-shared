@@ -32,6 +32,7 @@ import logging
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 
 from features.execution_socket import (
+    CONNECTED_USER_CHANNEL_WEBSOCKETS,
     _broadcast_user_channel_message,
     _build_message,
     _register_user_websocket,
@@ -56,6 +57,8 @@ def mark_alert_fired(user_id: str, payload: dict) -> None:
     if not uid:
         return
     PENDING_ALERT_EVENTS.setdefault(uid, []).append(payload)
+    log.info("[alert_events_socket] TEMP DIAG queued alert_id=%s for user=%s (pending now: %d)",
+              payload.get("alert_id"), uid, len(PENDING_ALERT_EVENTS[uid]))
 
 
 async def _flush_pending_alert_events(user_id: str) -> None:
@@ -63,7 +66,11 @@ async def _flush_pending_alert_events(user_id: str) -> None:
     if not events:
         return
     message = _build_message("alert_fired", "Chart alert triggered", {"events": events})
-    await _broadcast_user_channel_message(user_id, ALERT_EVENTS_CHANNEL, message)
+    room_key = f"{user_id}:{ALERT_EVENTS_CHANNEL}"
+    sockets_in_room = len(CONNECTED_USER_CHANNEL_WEBSOCKETS.get(room_key) or [])
+    delivered = await _broadcast_user_channel_message(user_id, ALERT_EVENTS_CHANNEL, message)
+    log.info("[alert_events_socket] TEMP DIAG flush user=%s events=%d sockets_registered=%d delivered=%d",
+              user_id, len(events), sockets_in_room, delivered)
 
 
 @router.websocket("/ws/alert-events")
@@ -74,6 +81,7 @@ async def alert_events_socket(websocket: WebSocket) -> None:
         return
 
     _register_user_websocket(ALERT_EVENTS_CHANNEL, user_id, websocket)
+    log.info("[alert_events_socket] TEMP DIAG registered user=%s", user_id)
     await websocket.send_text(_build_message(
         "connection_established",
         "Alert events websocket connected",
@@ -91,7 +99,8 @@ async def alert_events_socket(websocket: WebSocket) -> None:
             except asyncio.TimeoutError:
                 pass
             await _flush_pending_alert_events(user_id)
-    except WebSocketDisconnect:
+    except WebSocketDisconnect as exc:
+        log.info("[alert_events_socket] TEMP DIAG disconnected user=%s code=%s reason=%s", user_id, getattr(exc, "code", None), getattr(exc, "reason", None))
         return
     except Exception:
         log.exception("[alert_events_socket] connection error for user %s", user_id)

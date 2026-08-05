@@ -51,6 +51,14 @@ from features.dhan_token_sync import _get_dhan_commodity_master as _load_dhan_co
 from features.mongo_data import MongoData
 from features.spot_atm_utils import KITE_INDEX_TOKENS
 
+# Longest any exchange-listed NSE/BSE F&O option or future contract
+# realistically trades before its own securityId is retired — comfortably
+# covers even the longest-dated monthly/far-month contracts, unlike
+# DHAN_HISTORICAL_CHUNK_DAYS's 365 days (built for stocks/indices, which have
+# had one stable securityId for years). See _clip_to_contract_lifetime's own
+# docstring for why this matters.
+_DERIVATIVE_HISTORICAL_CHUNK_DAYS = 90
+
 STOCKS_COLLECTION = "scanner_stocks_list"
 # Every NSE cash-equity Dhan lists (see algo.simulator/api.py's
 # /algo/sync-stocks-from-dhan) — a superset of STOCKS_COLLECTION, which only
@@ -138,6 +146,16 @@ DEFAULT_SCANNER_INDEXES: list[dict[str, Any]] = [
 
 _index_history_chunk_cache: dict[str, tuple[float, dict[str, Any]]] = {}
 _INDEX_HISTORY_CACHE_TTL_SECONDS = 20.0
+# EOD (non-intraday) bars for any date fully in the past never change again —
+# only today's still-forming daily candle does — so a short TTL here just
+# means every repeat view of the same symbol/range re-pays the shared
+# cross-process Dhan rate gate (wait_for_dhan_slot, ~1 req/sec account-wide
+# budget — see post_dhan_chart_request) for data that was already correct.
+# That gate is what actually made a Terminal chart's first historical-data
+# request feel slow; this is what keeps every OTHER view of the same
+# symbol within a session from paying it again. Intraday resolutions keep
+# the short TTL above — those genuinely go stale within a session.
+_INDEX_HISTORY_EOD_CACHE_TTL_SECONDS = 1800.0
 _index_history_chunk_inflight_lock = threading.Lock()
 _index_history_chunk_inflight: dict[str, dict[str, Any]] = {}
 
@@ -344,6 +362,35 @@ def get_option_strikes(instrument: str, expiry: str) -> list[dict[str, Any]]:
         entry = by_strike.setdefault(strike, {"strike": strike, "CE": False, "PE": False})
         entry[option_type] = True
     return [by_strike[k] for k in sorted(by_strike.keys())]
+
+
+def _clip_to_contract_lifetime(
+    effective_from: datetime, effective_to: datetime, expiry: str,
+) -> tuple[datetime, datetime, bool]:
+    """
+    Clips [effective_from, effective_to] to an option/future contract's
+    plausible real trading lifetime — from _DERIVATIVE_HISTORICAL_CHUNK_DAYS
+    before its own expiry, up to expiry itself. A derivative's Dhan
+    securityId is freshly issued for that one contract cycle and never
+    traded outside this window, so asking for a wider range (e.g. the same
+    up-to-365-day default stocks/indices use) means most of the request
+    predates the securityId ever existing — confirmed live, Dhan's EOD
+    /v2/charts/historical rejects the WHOLE call with DH-905 ("no data
+    present") after 6 rate-gated retries (slow) instead of partial-returning
+    what it has, surfacing as a hard "Chart failed to load" for what should
+    just be an empty, valid backfill-pagination result (e.g. a chart paging
+    further back in time than this contract has ever existed).
+
+    Returns (clipped_from, clipped_to, is_empty) — is_empty is True when the
+    whole requested window falls outside the contract's lifetime, meaning
+    the caller should skip the Dhan call entirely and use an empty candle
+    list instead.
+    """
+    expiry_date = datetime.strptime(str(expiry or "").strip()[:10], "%Y-%m-%d")
+    contract_earliest = expiry_date - timedelta(days=_DERIVATIVE_HISTORICAL_CHUNK_DAYS)
+    clipped_from = max(effective_from, contract_earliest)
+    clipped_to = min(effective_to, expiry_date)
+    return clipped_from, clipped_to, clipped_from > clipped_to
 
 
 def _resolve_option_contract(instrument: str, expiry: str, strike: float, option_type: str) -> dict[str, Any] | None:
@@ -567,8 +614,9 @@ def get_index_historical_chart_bars(
         effective_from = max(from_date, effective_to - max_chunk_span)
 
     cache_key = f"{symbol}:{resolution}:{broker}:{int(effective_from.timestamp())}:{int(effective_to.timestamp())}"
+    cache_ttl = _INDEX_HISTORY_CACHE_TTL_SECONDS if is_intraday else _INDEX_HISTORY_EOD_CACHE_TTL_SECONDS
     cached = _index_history_chunk_cache.get(cache_key)
-    if cached and (time.time() - cached[0]) <= _INDEX_HISTORY_CACHE_TTL_SECONDS:
+    if cached and (time.time() - cached[0]) <= cache_ttl:
         return cached[1]
 
     wait_event: threading.Event | None = None
@@ -591,7 +639,7 @@ def get_index_historical_chart_bars(
         if wait_record and wait_record.get("result") is not None:
             return wait_record["result"]
         cached = _index_history_chunk_cache.get(cache_key)
-        if cached and (time.time() - cached[0]) <= _INDEX_HISTORY_CACHE_TTL_SECONDS:
+        if cached and (time.time() - cached[0]) <= cache_ttl:
             return cached[1]
         raise Exception("Historical chart request finished without cache result.")
 
@@ -774,8 +822,9 @@ def get_symbol_historical_chart_bars(
     # share the same instrument) — fold the resolved contract's own token in.
     cache_symbol_part = f"{symbol.upper()}:{option_contract['token']}" if option_contract else symbol.upper()
     cache_key = f"{symbol_type}:{cache_symbol_part}:{resolution}:{broker}:{int(effective_from.timestamp())}:{int(effective_to.timestamp())}"
+    cache_ttl = _INDEX_HISTORY_CACHE_TTL_SECONDS if is_intraday else _INDEX_HISTORY_EOD_CACHE_TTL_SECONDS
     cached = _index_history_chunk_cache.get(cache_key)
-    if cached and (time.time() - cached[0]) <= _INDEX_HISTORY_CACHE_TTL_SECONDS:
+    if cached and (time.time() - cached[0]) <= cache_ttl:
         return cached[1]
 
     wait_event: threading.Event | None = None
@@ -798,7 +847,7 @@ def get_symbol_historical_chart_bars(
         if wait_record and wait_record.get("result") is not None:
             return wait_record["result"]
         cached = _index_history_chunk_cache.get(cache_key)
-        if cached and (time.time() - cached[0]) <= _INDEX_HISTORY_CACHE_TTL_SECONDS:
+        if cached and (time.time() - cached[0]) <= cache_ttl:
             return cached[1]
         raise Exception("Historical chart request finished without cache result.")
 
@@ -851,7 +900,12 @@ def get_symbol_historical_chart_bars(
             # FUTIDX for index underlyings (NIFTY/BANKNIFTY/...), FUTSTK for
             # everything else — same distinction Dhan's own API draws.
             dhan_instrument = "FUTIDX" if symbol.upper() in DHAN_INDEX_SECURITY_IDS else "FUTSTK"
-            if is_intraday:
+            effective_from, effective_to, contract_out_of_range = _clip_to_contract_lifetime(
+                effective_from, effective_to, contract["expiry"],
+            )
+            if contract_out_of_range:
+                candles = []
+            elif is_intraday:
                 native_interval, factor, _ = _DHAN_INTRADAY_RESOLUTION_MAP[resolution]
                 candles = _fetch_dhan_intraday_candles(
                     access_token, contract["token"], contract["ws_segment"], dhan_instrument,
@@ -859,10 +913,18 @@ def get_symbol_historical_chart_bars(
                 )
                 candles = _aggregate_intraday_candles(candles, factor)
             else:
-                candles = _fetch_dhan_daily_candles(
+                # See _clip_to_contract_lifetime's docstring — /v2/charts/historical
+                # (EOD) unreliably DH-905's on a derivative's own securityId, so
+                # daily bars are derived from /v2/charts/intraday instead, same
+                # workaround already proven for indices (fetch_dhan_daily_index_
+                # candles_cached above), just without that function's persistent
+                # per-day Mongo cache — a derivative's own short lifetime means
+                # this "365-day EOD in one call" convenience isn't in play anyway.
+                candles = _fetch_dhan_intraday_candles(
                     access_token, contract["token"], contract["ws_segment"], dhan_instrument,
-                    effective_from, effective_to,
+                    "60", effective_from, effective_to,
                 )
+                candles = _aggregate_intraday_candles(candles, 1000)
         elif symbol_type == "option":  # exact contract, resolved above via _resolve_option_contract
             _, access_token = _load_dhan_credentials_any()
             if not access_token:
@@ -870,7 +932,12 @@ def get_symbol_historical_chart_bars(
             # OPTIDX for index underlyings (NIFTY/BANKNIFTY/...), OPTSTK for
             # everything else — same distinction the FUTIDX/FUTSTK branch above draws.
             dhan_instrument = "OPTIDX" if symbol.upper() in DHAN_INDEX_SECURITY_IDS else "OPTSTK"
-            if is_intraday:
+            effective_from, effective_to, contract_out_of_range = _clip_to_contract_lifetime(
+                effective_from, effective_to, expiry,
+            )
+            if contract_out_of_range:
+                candles = []
+            elif is_intraday:
                 native_interval, factor, _ = _DHAN_INTRADAY_RESOLUTION_MAP[resolution]
                 candles = _fetch_dhan_intraday_candles(
                     access_token, option_contract["token"], option_contract["ws_segment"], dhan_instrument,
@@ -878,10 +945,16 @@ def get_symbol_historical_chart_bars(
                 )
                 candles = _aggregate_intraday_candles(candles, factor)
             else:
-                candles = _fetch_dhan_daily_candles(
+                # See the "future" branch's own copy of this comment — same
+                # EOD-endpoint DH-905 unreliability, same intraday-aggregate
+                # workaround (confirmed live: NIFTY 24600 PE 2026-08-04's daily
+                # chart failed with DH-905 via /v2/charts/historical before
+                # this change).
+                candles = _fetch_dhan_intraday_candles(
                     access_token, option_contract["token"], option_contract["ws_segment"], dhan_instrument,
-                    effective_from, effective_to,
+                    "60", effective_from, effective_to,
                 )
+                candles = _aggregate_intraday_candles(candles, 1000)
         else:  # commodity — always Dhan, front-month FUTCOM contract
             commodity_master = _load_dhan_commodity_master()
             contracts = [

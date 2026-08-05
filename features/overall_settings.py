@@ -168,11 +168,19 @@ def _build_cycle_sub_trades_for_overall_checks(
     lot_size: int,
     spot: float,
     idle_configs: dict = None,
+    next_idx=None,
+    next_day: str = None,
+    next_exit_time: str = None,
 ) -> Tuple[list, float]:
     """
     Build the actual sub-trade path for one cycle using the same leg processing
     logic as the backtest engine. This keeps overall SL detection aligned with
     real trail SL, leg re-entry, lazy-leg momentum, and actual entry timing.
+
+    next_idx/next_day/next_exit_time (default None — no behavior change for
+    any existing caller): forwarded straight to _process_leg for
+    whole-strategy BTST, so Overall SL detection sees the exact same
+    Day-1->Day-2 sub-trade path the real per-leg simulation produces.
     """
     from .backtest_engine import (
         _resolve_expiry,
@@ -265,6 +273,7 @@ def _build_cycle_sub_trades_for_overall_checks(
             trail_type=trail_type, trail_x=trail_x, trail_y=trail_y,
             reentry_sl_next_ref=reentry_sl_next_ref,
             reentry_tp_next_ref=reentry_tp_next_ref,
+            next_idx=next_idx, next_day=next_day, next_exit_time=next_exit_time,
         )
 
         if result.get("sub_trades"):
@@ -293,32 +302,49 @@ def _build_cycle_sub_trades_for_overall_checks(
     return sub_trades, total_entry_premium
 
 
-def _build_minute_pnl_from_sub_trades(idx, day: str, sub_trades: list, entry_time: str, exit_time: str) -> list:
+def _build_minute_pnl_from_sub_trades(
+    idx, day: str, sub_trades: list, entry_time: str, exit_time: str,
+    next_idx=None, next_day: str = None, next_exit_time: str = None,
+) -> list:
+    """
+    next_idx/next_day/next_exit_time (default None — no behavior change for
+    any existing caller): scan Day 2's candles too, for whole-strategy BTST.
+    Sub-trades carry their own entry_date/exit_date (from _process_leg) so
+    a leg that already exited on Day 1 stays correctly "realized" for the
+    whole of Day 2's scan, without re-pricing it.
+    """
+    day_specs = [(idx, day, entry_time, "23:59" if next_idx is not None else exit_time)]
+    if next_idx is not None and next_day:
+        day_specs.append((next_idx, next_day, "00:00", next_exit_time or exit_time))
+
     timeline = []
-    for t in idx._all_times.get(day, []):
-        if t <= entry_time or t > exit_time:
-            continue
-
-        combined = 0.0
-        for st in sub_trades:
-            st_entry = st.get("entry_time", "")
-            st_exit = st.get("exit_time", "")
-            if not st_entry or st_entry > t:
+    for scan_idx, scan_day, t_lo, t_hi in day_specs:
+        for t in scan_idx._all_times.get(scan_day, []):
+            if t <= t_lo or t > t_hi:
                 continue
 
-            if st_exit and st_exit <= t:
-                combined += st.get("pnl", 0)
-                continue
+            combined = 0.0
+            for st in sub_trades:
+                st_entry      = st.get("entry_time", "")
+                st_entry_date = st.get("entry_date", day)
+                if not st_entry or (st_entry_date == scan_day and st_entry > t) or st_entry_date > scan_day:
+                    continue
 
-            cur_price = idx.get_close(day, t, st.get("_expiry", ""), st.get("strike"), st.get("option_type", ""))
-            if cur_price is None:
-                continue
+                st_exit      = st.get("exit_time", "")
+                st_exit_date = st.get("exit_date", day)
+                if st_exit and (st_exit_date < scan_day or (st_exit_date == scan_day and st_exit <= t)):
+                    combined += st.get("pnl", 0)
+                    continue
 
-            qty = st.get("_lots", 1) * st.get("_lot_size", 1)
-            direction = -1 if st.get("entry_action", "SELL") == "SELL" else 1
-            combined += (cur_price - st.get("entry_price", 0)) * qty * direction
+                cur_price = scan_idx.get_close(scan_day, t, st.get("_expiry", ""), st.get("strike"), st.get("option_type", ""))
+                if cur_price is None:
+                    continue
 
-        timeline.append((t, round(combined, 2)))
+                qty = st.get("_lots", 1) * st.get("_lot_size", 1)
+                direction = -1 if st.get("entry_action", "SELL") == "SELL" else 1
+                combined += (cur_price - st.get("entry_price", 0)) * qty * direction
+
+            timeline.append((t, scan_day, round(combined, 2)))
     return timeline
 
 
@@ -394,7 +420,10 @@ def find_overall_sl_exit_time(
     spot: float,
     idle_configs: dict = None,
     base_pnl_before_cycle: float = 0.0,
-) -> Optional[str]:
+    next_idx=None,
+    next_day: str = None,
+    next_exit_time: str = None,
+) -> Tuple[Optional[str], Optional[str]]:
     """
     Scan candles minute-by-minute to find when total strategy MTM P&L
     first hits the overall SL threshold.
@@ -403,15 +432,24 @@ def find_overall_sl_exit_time(
     and triggers a NextLeg (lazy leg), that lazy leg is added to the simulation
     from its trigger candle onwards so the overall SL threshold is computed
     on the full strategy MTM (main + lazy legs combined).
+
+    next_idx/next_day/next_exit_time (default None — no behavior change for
+    any existing caller): whole-strategy BTST — scans Day 2 too if Day 1
+    never hits the threshold.
+
+    Returns (exit_time, exit_date) — exit_date is always `day` for existing
+    (non-BTST) callers, matching prior behavior exactly; (None, None) if
+    never triggered.
     """
     if overall_sl_type == "None" or overall_sl_val <= 0:
-        return None
+        return None, None
 
     sub_trades, total_entry_premium = _build_cycle_sub_trades_for_overall_checks(
         idx, day, entry_time, exit_time, legs, expiries, step, lot_size, spot, idle_configs,
+        next_idx=next_idx, next_day=next_day, next_exit_time=next_exit_time,
     )
     if not sub_trades:
-        return None
+        return None, None
 
     # ── Threshold ─────────────────────────────────────────────────────────────
     if overall_sl_type == "PremiumPercentage":
@@ -419,12 +457,15 @@ def find_overall_sl_exit_time(
     else:
         threshold = -overall_sl_val
 
-    for t, total_mtm in _build_minute_pnl_from_sub_trades(idx, day, sub_trades, entry_time, exit_time):
+    for t, mtm_day, total_mtm in _build_minute_pnl_from_sub_trades(
+        idx, day, sub_trades, entry_time, exit_time,
+        next_idx=next_idx, next_day=next_day, next_exit_time=next_exit_time,
+    ):
         day_total_mtm = round(base_pnl_before_cycle + total_mtm, 2)
         if day_total_mtm <= threshold:
-            return t
+            return t, mtm_day
 
-    return None
+    return None, None
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -445,7 +486,10 @@ def find_overall_tgt_exit_time(
     spot: float,
     idle_configs: dict = None,
     base_pnl_before_cycle: float = 0.0,
-) -> Optional[str]:
+    next_idx=None,
+    next_day: str = None,
+    next_exit_time: str = None,
+) -> Tuple[Optional[str], Optional[str]]:
     """
     Scan candles minute-by-minute to find when total strategy MTM P&L
     first hits the overall Target threshold (total_pnl >= threshold).
@@ -458,6 +502,16 @@ def find_overall_tgt_exit_time(
     • Returns the first candle time where total_pnl >= threshold, or None.
 
     Note: Momentum-entry legs are approximated as entering at strategy entry_time.
+
+    next_idx/next_day/next_exit_time (default None — no behavior change for
+    any existing caller): whole-strategy BTST — legs still enter on Day 1 at
+    entry_time (unchanged), but if Day 1's own candles never hit the
+    threshold, scanning continues into Day 2 using the SAME leg_states (so a
+    leg already locked via SL/Target on Day 1 correctly stays locked).
+
+    Returns (exit_time, exit_date) — exit_date is always `day` for existing
+    (non-BTST) callers, matching prior behavior exactly; (None, None) if
+    never triggered.
     """
     from .backtest_engine import (
         _resolve_expiry, _pick_strike,
@@ -465,7 +519,7 @@ def find_overall_tgt_exit_time(
     )
 
     if overall_tgt_type == "None" or overall_tgt_val <= 0:
-        return None
+        return None, None
 
     # ── Build per-leg state ───────────────────────────────────────────────────
     leg_states: list = []
@@ -488,16 +542,16 @@ def find_overall_tgt_exit_time(
 
         expiry = _resolve_expiry(day, expiry_kind, expiries)
         if expiry is None:
-            return None
+            return None, None
 
         strike = _pick_strike(idx, day, entry_time, expiry, otype, spot,
                               entry_type, strike_param, step)
         if strike is None:
-            return None
+            return None, None
 
         entry_price = idx.get_close(day, entry_time, expiry, strike, otype)
         if entry_price is None:
-            return None
+            return None, None
 
         entry_spot = idx.get_spot(day, entry_time) or 0.0
         sl_px  = _calc_trigger_price(entry_price, entry_spot, position,
@@ -527,79 +581,84 @@ def find_overall_tgt_exit_time(
     else:
         threshold = overall_tgt_val
 
-    # ── Scan minute-by-minute ─────────────────────────────────────────────────
-    times = sorted(
-        t for t in idx._all_times.get(day, [])
-        if entry_time < t <= exit_time
-    )
+    # ── Scan minute-by-minute (Day 1, then Day 2 if next_idx provided) ────────
+    day_specs = [(idx, day, entry_time, "23:59" if next_idx is not None else exit_time)]
+    if next_idx is not None and next_day:
+        day_specs.append((next_idx, next_day, "00:00", next_exit_time or exit_time))
 
-    for t in times:
-        total_mtm = 0.0
-        new_lazy_states = []
+    for scan_idx, scan_day, t_lo, t_hi in day_specs:
+        times = sorted(
+            t for t in scan_idx._all_times.get(scan_day, [])
+            if t_lo < t <= t_hi
+        )
 
-        for ls in leg_states:
-            if t <= ls.get("active_from", entry_time):
+        for t in times:
+            total_mtm = 0.0
+            new_lazy_states = []
+
+            for ls in leg_states:
+                if scan_day == day and t <= ls.get("active_from", entry_time):
+                    if ls["realized_pnl"] is not None:
+                        total_mtm += ls["realized_pnl"]
+                    continue
+
                 if ls["realized_pnl"] is not None:
                     total_mtm += ls["realized_pnl"]
-                continue
+                    continue
 
-            if ls["realized_pnl"] is not None:
-                total_mtm += ls["realized_pnl"]
-                continue
+                cur_price = scan_idx.get_close(scan_day, t, ls["expiry"], ls["strike"], ls["otype"])
+                if cur_price is None:
+                    continue
 
-            cur_price = idx.get_close(day, t, ls["expiry"], ls["strike"], ls["otype"])
-            if cur_price is None:
-                continue
-
-            # Lock PnL if individual SL fires
-            if ls["sl_px"] is not None:
-                sl_hit = (
-                    (ls["position"] == "SELL" and cur_price >= ls["sl_px"]) or
-                    (ls["position"] == "BUY"  and cur_price <= ls["sl_px"])
-                )
-                if sl_hit:
-                    ls["realized_pnl"] = _calc_pnl(
-                        ls["position"], ls["entry_price"], ls["sl_px"],
-                        ls["lots"], ls["lot_size"],
+                # Lock PnL if individual SL fires
+                if ls["sl_px"] is not None:
+                    sl_hit = (
+                        (ls["position"] == "SELL" and cur_price >= ls["sl_px"]) or
+                        (ls["position"] == "BUY"  and cur_price <= ls["sl_px"])
                     )
-                    total_mtm += ls["realized_pnl"]
-                    if ls.get("next_leg_ref") and idle_configs and ls["next_leg_ref"] in idle_configs:
-                        spot_now = idx.get_spot(day, t) or spot
-                        lazy_state = _build_lazy_leg_state(
-                            idx, day, t, expiries, step, lot_size,
-                            idle_configs[ls["next_leg_ref"]], spot_now,
+                    if sl_hit:
+                        ls["realized_pnl"] = _calc_pnl(
+                            ls["position"], ls["entry_price"], ls["sl_px"],
+                            ls["lots"], ls["lot_size"],
                         )
-                        if lazy_state:
-                            new_lazy_states.append(lazy_state)
-                    continue
+                        total_mtm += ls["realized_pnl"]
+                        if ls.get("next_leg_ref") and idle_configs and ls["next_leg_ref"] in idle_configs:
+                            spot_now = scan_idx.get_spot(scan_day, t) or spot
+                            lazy_state = _build_lazy_leg_state(
+                                scan_idx, scan_day, t, expiries, step, lot_size,
+                                idle_configs[ls["next_leg_ref"]], spot_now,
+                            )
+                            if lazy_state:
+                                new_lazy_states.append(lazy_state)
+                        continue
 
-            # Lock PnL if individual Target fires
-            if ls["tgt_px"] is not None:
-                tgt_hit = (
-                    (ls["position"] == "SELL" and cur_price <= ls["tgt_px"]) or
-                    (ls["position"] == "BUY"  and cur_price >= ls["tgt_px"])
-                )
-                if tgt_hit:
-                    ls["realized_pnl"] = _calc_pnl(
-                        ls["position"], ls["entry_price"], ls["tgt_px"],
-                        ls["lots"], ls["lot_size"],
+                # Lock PnL if individual Target fires
+                if ls["tgt_px"] is not None:
+                    tgt_hit = (
+                        (ls["position"] == "SELL" and cur_price <= ls["tgt_px"]) or
+                        (ls["position"] == "BUY"  and cur_price >= ls["tgt_px"])
                     )
-                    total_mtm += ls["realized_pnl"]
-                    continue
+                    if tgt_hit:
+                        ls["realized_pnl"] = _calc_pnl(
+                            ls["position"], ls["entry_price"], ls["tgt_px"],
+                            ls["lots"], ls["lot_size"],
+                        )
+                        total_mtm += ls["realized_pnl"]
+                        continue
 
-            # Active leg — unrealized MTM
-            total_mtm += _calc_pnl(
-                ls["position"], ls["entry_price"], cur_price,
-                ls["lots"], ls["lot_size"],
-            )
+                # Active leg — unrealized MTM
+                total_mtm += _calc_pnl(
+                    ls["position"], ls["entry_price"], cur_price,
+                    ls["lots"], ls["lot_size"],
+                )
 
-        leg_states.extend(new_lazy_states)
+            leg_states.extend(new_lazy_states)
 
-        day_total_mtm = round(base_pnl_before_cycle + total_mtm, 2)
-        if day_total_mtm >= threshold:
-            return t
+            day_total_mtm = round(base_pnl_before_cycle + total_mtm, 2)
+            if day_total_mtm >= threshold:
+                return t, scan_day
 
-    return None
+    return None, None
 
 
 def resolve_effective_exit(
@@ -633,30 +692,45 @@ def resolve_all_exits(
     overall_tgt_time: Optional[str],
     lock_exit_time: Optional[str],
     eod_exit_time: str,
-) -> Tuple[Optional[str], Optional[str], Optional[str], str]:
+    overall_sl_date: Optional[str] = None,
+    overall_tgt_date: Optional[str] = None,
+    lock_exit_date: Optional[str] = None,
+    eod_exit_date: Optional[str] = None,
+) -> Tuple[Optional[str], Optional[str], Optional[str], str, str]:
     """
     Resolve all possible exit times (SL/TrailSL, Target, Lock/LockTrail) to a
     single effective_exit.
 
-    Returns (overall_sl_time, overall_tgt_time, lock_exit_time, effective_exit).
+    Returns (overall_sl_time, overall_tgt_time, lock_exit_time, effective_exit, effective_exit_date).
 
     Priority on tie: SL wins over Target/Lock; Target wins over Lock.
+
+    Date params (all default None — no behavior change for any existing
+    caller, since when omitted every candidate is treated as being on the
+    same day and comparison falls back to bare time-string ordering exactly
+    as before): needed once whole-strategy BTST means different triggers
+    can land on Day 1 vs Day 2 — a bare time-string compare ("10:15" <
+    "14:00") would wrongly rank a Day-2 10:15 trigger before a Day-1 14:00
+    one. Candidates are ranked by (date, time, priority) instead.
     """
-    # (time, priority) — lower priority number = fires first on tie
+    # (date, time, priority) — lower priority number = fires first on tie;
+    # date defaults to "" so non-BTST callers (all candidates same day)
+    # compare purely on time, identical to the old behavior.
     candidates: list = []
     if overall_sl_time:
-        candidates.append((overall_sl_time,  0))
+        candidates.append((overall_sl_date or "", overall_sl_time, 0, overall_sl_time, overall_sl_date or eod_exit_date or ""))
     if overall_tgt_time:
-        candidates.append((overall_tgt_time, 1))
+        candidates.append((overall_tgt_date or "", overall_tgt_time, 1, overall_tgt_time, overall_tgt_date or eod_exit_date or ""))
     if lock_exit_time:
-        candidates.append((lock_exit_time,   2))
+        candidates.append((lock_exit_date or "", lock_exit_time, 2, lock_exit_time, lock_exit_date or eod_exit_date or ""))
 
     if not candidates:
-        return overall_sl_time, overall_tgt_time, lock_exit_time, eod_exit_time
+        return overall_sl_time, overall_tgt_time, lock_exit_time, eod_exit_time, eod_exit_date or ""
 
-    candidates.sort(key=lambda x: (x[0], x[1]))
-    effective_exit = candidates[0][0]
-    return overall_sl_time, overall_tgt_time, lock_exit_time, effective_exit
+    candidates.sort(key=lambda x: (x[0], x[1], x[2]))
+    effective_exit      = candidates[0][3]
+    effective_exit_date = candidates[0][4]
+    return overall_sl_time, overall_tgt_time, lock_exit_time, effective_exit, effective_exit_date
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -723,14 +797,18 @@ def run_overall_reentry(
     # ── Find effective exit for this cycle (may be shortened by another overall SL) ──
     cycle_sl_val = overall_sl_val * (cycle_number + 1) if overall_sl_type != "None" else overall_sl_val
     cycle_tgt_val = overall_tgt_val * (cycle_number + 1) if overall_tgt_type != "None" else overall_tgt_val
-    next_overall_sl_time = find_overall_sl_exit_time(
+    # Overall Reentry cycles are not (yet) BTST-day-aware — bounded to
+    # whichever single day `day` refers to, same as before this feature
+    # (the AlgoTest reference demo doesn't even configure this). Disclosed
+    # limitation, not an oversight.
+    next_overall_sl_time, _next_overall_sl_date = find_overall_sl_exit_time(
         idx, day, trigger_time, exit_time,
         leg_configs, expiries, step, lot_size,
         overall_sl_type, cycle_sl_val, spot,
         idle_configs=idle_configs,
         base_pnl_before_cycle=base_pnl_before_cycle,
     )
-    next_overall_tgt_time = find_overall_tgt_exit_time(
+    next_overall_tgt_time, _next_overall_tgt_date = find_overall_tgt_exit_time(
         idx, day, trigger_time, exit_time,
         leg_configs, expiries, step, lot_size,
         overall_tgt_type, cycle_tgt_val, spot,
@@ -1010,14 +1088,14 @@ def run_overall_reentry_tgt(
     # ── Find effective exit for this cycle (SL or Target may fire, SL wins on tie) ──
     cycle_sl_val = overall_sl_val * (cycle_number + 1) if overall_sl_type != "None" else overall_sl_val
     cycle_tgt_val = overall_tgt_val * (cycle_number + 1) if overall_tgt_type != "None" else overall_tgt_val
-    next_sl_time = find_overall_sl_exit_time(
+    next_sl_time, _next_sl_date = find_overall_sl_exit_time(
         idx, day, trigger_time, exit_time,
         leg_configs, expiries, step, lot_size,
         overall_sl_type, cycle_sl_val, spot,
         idle_configs=idle_configs,
         base_pnl_before_cycle=base_pnl_before_cycle,
     )
-    next_tgt_time = find_overall_tgt_exit_time(
+    next_tgt_time, _next_tgt_date = find_overall_tgt_exit_time(
         idx, day, trigger_time, exit_time,
         leg_configs, expiries, step, lot_size,
         overall_tgt_type, cycle_tgt_val, spot,
@@ -1305,22 +1383,35 @@ def _build_leg_scan_states(
     return leg_states, total_entry_premium
 
 
-def _iter_total_mtm(idx, day: str, entry_time: str, exit_time: str, leg_states: list):
+def _iter_total_mtm(
+    idx, day: str, entry_time: str, exit_time: str, leg_states: list,
+    next_idx=None, next_day: str = None, next_exit_time: str = None,
+):
     """
-    Generator: yields (time_str, total_mtm) for each candle from entry+1 to exit.
+    Generator: yields (time_str, date_str, total_mtm) for each candle from
+    entry+1 to exit.
 
     Per-leg PnL is locked (realized_pnl set) when individual SL or TGT fires.
     Mutates leg_states in place — do NOT reuse the same leg_states across
     multiple detection calls.
+
+    next_idx/next_day/next_exit_time (default None — no behavior change for
+    any existing caller): continues the scan into Day 2 for whole-strategy
+    BTST, using the SAME leg_states so Day-1 locks correctly carry over.
     """
     from .backtest_engine import _calc_pnl
 
-    times = sorted(
-        t for t in idx._all_times.get(day, [])
-        if entry_time < t <= exit_time
-    )
+    day_specs = [(idx, day, entry_time, "23:59" if next_idx is not None else exit_time)]
+    if next_idx is not None and next_day:
+        day_specs.append((next_idx, next_day, "00:00", next_exit_time or exit_time))
 
-    for t in times:
+    for scan_idx, scan_day, t_lo, t_hi in day_specs:
+      times = sorted(
+          t for t in scan_idx._all_times.get(scan_day, [])
+          if t_lo < t <= t_hi
+      )
+
+      for t in times:
         total_mtm = 0.0
 
         for ls in leg_states:
@@ -1328,7 +1419,7 @@ def _iter_total_mtm(idx, day: str, entry_time: str, exit_time: str, leg_states: 
                 total_mtm += ls["realized_pnl"]
                 continue
 
-            cur_price = idx.get_close(day, t, ls["expiry"], ls["strike"], ls["otype"])
+            cur_price = scan_idx.get_close(scan_day, t, ls["expiry"], ls["strike"], ls["otype"])
             if cur_price is None:
                 continue
 
@@ -1365,7 +1456,7 @@ def _iter_total_mtm(idx, day: str, entry_time: str, exit_time: str, leg_states: 
                 ls["lots"], ls["lot_size"],
             )
 
-        yield t, total_mtm
+        yield t, scan_day, total_mtm
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -1427,32 +1518,42 @@ def find_lock_exit_time(
     trigger_profit: float,
     lock_profit: float,
     spot: float,
-) -> Optional[str]:
+    next_idx=None,
+    next_day: str = None,
+    next_exit_time: str = None,
+) -> Tuple[Optional[str], Optional[str]]:
     """
     Lock feature exit detection.
 
     Logic:
       1. Scan minute-by-minute until total P&L >= trigger_profit → lock activated.
       2. Once locked, return the first candle where total P&L <= lock_profit.
+
+    next_idx/next_day/next_exit_time (default None — no behavior change for
+    any existing caller): whole-strategy BTST, scans Day 2 too.
+    Returns (exit_time, exit_date); (None, None) if never triggered.
     """
     if trigger_profit <= 0:
-        return None
+        return None, None
 
     leg_states, _ = _build_leg_scan_states(
         idx, day, entry_time, legs, expiries, step, lot_size, spot
     )
     if leg_states is None:
-        return None
+        return None, None
 
     lock_activated = False
 
-    for t, total_mtm in _iter_total_mtm(idx, day, entry_time, exit_time, leg_states):
+    for t, mtm_day, total_mtm in _iter_total_mtm(
+        idx, day, entry_time, exit_time, leg_states,
+        next_idx=next_idx, next_day=next_day, next_exit_time=next_exit_time,
+    ):
         if not lock_activated and total_mtm >= trigger_profit:
             lock_activated = True
         if lock_activated and total_mtm <= lock_profit:
-            return t
+            return t, mtm_day
 
-    return None
+    return None, None
 
 
 def find_lock_trail_exit_time(
@@ -1469,7 +1570,10 @@ def find_lock_trail_exit_time(
     trail_for_every: float,
     trail_by: float,
     spot: float,
-) -> Optional[str]:
+    next_idx=None,
+    next_day: str = None,
+    next_exit_time: str = None,
+) -> Tuple[Optional[str], Optional[str]]:
     """
     Lock and Trail feature exit detection.
 
@@ -1483,21 +1587,31 @@ def find_lock_trail_exit_time(
       P&L hits 12000 → floor = 6000
       P&L hits 14000 → floor = 7000
       P&L falls to 6800 → exit (below floor 7000)
+
+    next_idx/next_day/next_exit_time (default None — no behavior change for
+    any existing caller): whole-strategy BTST, scans Day 2 too — the trail
+    floor/next_trail_level state naturally carries across the day boundary
+    since the scan loop itself is unbroken (_iter_total_mtm just continues
+    onto Day 2's candles).
+    Returns (exit_time, exit_date); (None, None) if never triggered.
     """
     if trigger_profit <= 0 or trail_for_every <= 0:
-        return None
+        return None, None
 
     leg_states, _ = _build_leg_scan_states(
         idx, day, entry_time, legs, expiries, step, lot_size, spot
     )
     if leg_states is None:
-        return None
+        return None, None
 
     lock_activated   = False
     lock_floor       = lock_profit
     next_trail_level = trigger_profit + trail_for_every
 
-    for t, total_mtm in _iter_total_mtm(idx, day, entry_time, exit_time, leg_states):
+    for t, mtm_day, total_mtm in _iter_total_mtm(
+        idx, day, entry_time, exit_time, leg_states,
+        next_idx=next_idx, next_day=next_day, next_exit_time=next_exit_time,
+    ):
         if not lock_activated:
             if total_mtm >= trigger_profit:
                 lock_activated = True
@@ -1509,9 +1623,9 @@ def find_lock_trail_exit_time(
                 next_trail_level += trail_for_every
 
             if total_mtm <= lock_floor:
-                return t
+                return t, mtm_day
 
-    return None
+    return None, None
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -1565,7 +1679,10 @@ def find_trail_sl_exit_time(
     trail_for_every: float,
     trail_by: float,
     spot: float,
-) -> Optional[str]:
+    next_idx=None,
+    next_day: str = None,
+    next_exit_time: str = None,
+) -> Tuple[Optional[str], Optional[str]]:
     """
     Dynamic Overall Trail SL — improves (moves toward profit) as P&L rises.
 
@@ -1582,17 +1699,23 @@ def find_trail_sl_exit_time(
 
     PremiumPercentage mode:
       Both overall_sl_val and trail values are % of total entry premium.
+
+    next_idx/next_day/next_exit_time (default None — no behavior change for
+    any existing caller): whole-strategy BTST, scans Day 2 too — the
+    trailing threshold state naturally carries across the day boundary
+    since the scan loop itself is unbroken.
+    Returns (exit_time, exit_date); (None, None) if never triggered.
     """
     if overall_sl_type == "None" or overall_sl_val <= 0:
-        return None
+        return None, None
     if trail_sl_type == "None" or trail_for_every <= 0 or trail_by <= 0:
-        return None
+        return None, None
 
     leg_states, total_entry_premium = _build_leg_scan_states(
         idx, day, entry_time, legs, expiries, step, lot_size, spot
     )
     if leg_states is None:
-        return None
+        return None, None
 
     # Convert to ₹ amounts for uniform comparison
     if overall_sl_type == "PremiumPercentage":
@@ -1606,13 +1729,16 @@ def find_trail_sl_exit_time(
 
     next_trail_trigger = trail_step  # first improvement fires at this P&L
 
-    for t, total_mtm in _iter_total_mtm(idx, day, entry_time, exit_time, leg_states):
+    for t, mtm_day, total_mtm in _iter_total_mtm(
+        idx, day, entry_time, exit_time, leg_states,
+        next_idx=next_idx, next_day=next_day, next_exit_time=next_exit_time,
+    ):
         # Improve the SL threshold as profit rises
         while total_mtm >= next_trail_trigger:
             sl_threshold       += trail_step_size   # less negative → toward profit
             next_trail_trigger += trail_step
 
         if total_mtm <= sl_threshold:
-            return t
+            return t, mtm_day
 
-    return None
+    return None, None

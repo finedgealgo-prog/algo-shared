@@ -14,7 +14,7 @@ from pymongo import MongoClient
 from pymongo import monitoring
 from pymongo import ASCENDING, DESCENDING
 
-MONGO_LIVE_DB_CONNECT = True  # True = VPS live DB | False = Local MongoDB
+MONGO_LIVE_DB_CONNECT = False  # True = VPS live DB | False = Local MongoDB
 
 _LIVE_MONGO_URI  = "mongodb://admin:finedgealgo0210@200.141.8.235:27017/?authSource=admin"
 _LOCAL_MONGO_URI = "mongodb://localhost:27017"
@@ -352,6 +352,24 @@ class MongoData:
                 background=True,
                 name="tv_alerts_active_indicator_resolution",
                 comment=self._comment("ensure_index", collection="tv_alerts", index="tv_alerts_active_indicator_resolution"),
+            )
+            # BTST Range Breakout — per-leg cycle, one doc per
+            # (trade_id, leg_id, cycle_day1). Unique index is the
+            # concurrency backstop against two workers racing to create the
+            # same cycle (second insert_one raises DuplicateKeyError,
+            # caller treats that as "already exists").
+            self._db["algo_leg_range_cycles"].create_index(
+                [("trade_id", ASCENDING), ("leg_id", ASCENDING), ("cycle_day1", ASCENDING)],
+                unique=True,
+                background=True,
+                name="uniq_leg_range_cycle_trade_leg_day1",
+                comment=self._comment("ensure_index", collection="algo_leg_range_cycles", index="uniq_leg_range_cycle_trade_leg_day1"),
+            )
+            self._db["algo_leg_range_cycles"].create_index(
+                [("activation_mode", ASCENDING), ("leg_range_state", ASCENDING)],
+                background=True,
+                name="leg_range_cycle_mode_state",
+                comment=self._comment("ensure_index", collection="algo_leg_range_cycles", index="leg_range_cycle_mode_state"),
             )
         except Exception as exc:
             _log.warning("[DB INDEX WARN] db=%s target=%s error=%s", DB_NAME, self._target, exc)

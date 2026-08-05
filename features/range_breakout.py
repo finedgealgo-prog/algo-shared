@@ -85,7 +85,7 @@ def parse_range_breakout(strategy: dict) -> Tuple[str, str, str, str, int, int]:
     cfg = strategy.get("RangeBreakout", {})
     t   = cfg.get("Type", "None")
 
-    if t == "None":
+    if t == "None" or t.endswith(".None") or not t:
         return "None", "High", "09:15", "09:30", -1, -1
 
     condition  = "Low" if "Low" in cfg.get("Condition", "High") else "High"
@@ -108,6 +108,57 @@ def parse_range_breakout(strategy: dict) -> Tuple[str, str, str, str, int, int]:
     if "Underlying" in t:
         return "Underlying", condition, start_time, end_time, -1, -1
     return "Instrument", condition, start_time, end_time, -1, -1
+
+
+def parse_leg_range_breakout(leg_cfg: dict) -> Tuple[str, str, str, str]:
+    """
+    Per-leg counterpart to parse_range_breakout() above — reads
+    leg_cfg["LegRangeBreakout"] instead of strategy["RangeBreakout"].
+
+    This is the real AlgoTest "Range Breakout BTST" mechanism: each leg
+    (CE, PE, ...) independently gets its own range/breakout config, tracking
+    that leg's own option premium (Instrument/BTSTInstrument) or the
+    underlying (Underlying/BTSTUnderlying) — NOT a shared strategy-level
+    signal. No DTE fields: Positional (multi-day, DTE-anchored) range
+    breakout remains a separate, strategy-level-only feature — see
+    parse_range_breakout() above, untouched.
+
+    Returns (rb_type, condition, start_time, end_time).
+      rb_type   : "Instrument" | "Underlying" |
+                  "BTSTInstrument" | "BTSTUnderlying" | "None"
+      condition : "High" | "Low"
+      start_time: "HH:MM"  (Day 1 for BTST types, same day otherwise)
+      end_time  : "HH:MM"  (Day 2 for BTST types, same day otherwise)
+
+    JSON config (per-leg, sibling to LegMomentum/LegStopLoss/... inside
+    each ListOfLegConfigs[i]):
+      "LegRangeBreakout": {
+          "Type":      "RangeBreakoutType.BTSTInstrument",
+          "Condition": "RangeCondition.High",
+          "StartTime": {"Hour": 14, "Minute": 30},
+          "EndTime":   {"Hour": 9,  "Minute": 17}
+      }
+    """
+    cfg = leg_cfg.get("LegRangeBreakout", {})
+    t   = cfg.get("Type", "None")
+
+    if t == "None" or t.endswith(".None") or not t:
+        return "None", "High", "09:15", "09:30"
+
+    condition  = "Low" if "Low" in cfg.get("Condition", "High") else "High"
+
+    st = cfg.get("StartTime", {})
+    et = cfg.get("EndTime",   {})
+    start_time = f"{int(st.get('Hour', 9)):02d}:{int(st.get('Minute', 15)):02d}"
+    end_time   = f"{int(et.get('Hour', 9)):02d}:{int(et.get('Minute', 30)):02d}"
+
+    if "BTSTUnderlying" in t:
+        return "BTSTUnderlying", condition, start_time, end_time
+    if "BTST" in t:
+        return "BTSTInstrument", condition, start_time, end_time
+    if "Underlying" in t:
+        return "Underlying", condition, start_time, end_time
+    return "Instrument", condition, start_time, end_time
 
 
 # ═══════════════════════════════════════════════════════════════════
