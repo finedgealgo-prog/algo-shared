@@ -21,7 +21,6 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-import time
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
@@ -55,44 +54,18 @@ _QUOTE_INSTRUMENT_BY_UNDERLYING = {
 # 1s cadence was hitting it on every tick regardless (~5s/instrument in practice, since the
 # expensive lookup only runs while a trade is actually pending activation), which is what
 # was driving mongod's CPU up (see the missing-index investigation this cache followed).
-# Fixing the missing indexes made each hit cheap; caching removes the repeat hits entirely
-# for the common case where the same (instrument, expiry) / exact contract gets re-resolved
-# every tick while a strategy sits waiting for its entry trigger. 10min TTL, not "once a day"
-# — leaves room for a same-day corrective edit to the collection to actually take effect.
-_TOKEN_CACHE_TTL = 600  # seconds
-_expiry_list_cache: dict[tuple[str, str], tuple[float, list[str]]] = {}   # (instrument, trade_date) → (cached_at, expiries)
-_token_doc_cache: dict[tuple[str, str, float, str], tuple[float, dict]] = {}  # (instrument, expiry, strike, option_type) → (cached_at, doc)
-
-
+# Backed by active_option_tokens_cache's whole-collection, once-a-day snapshot (current +
+# future expiries only — ~99.6% of the collection at any point in the day) instead of a
+# per-key lazy cache, so even the first lookup of a new (instrument, expiry, strike) each
+# day is a plain dict read, not a Mongo round trip.
 def _cached_expiries(db, instrument: str, trade_date: str) -> list[str]:
-    key = (instrument, trade_date)
-    cached = _expiry_list_cache.get(key)
-    now = time.monotonic()
-    if cached and now - cached[0] < _TOKEN_CACHE_TTL:
-        return cached[1]
-    expiries = sorted([
-        str(e) for e in db._db['active_option_tokens'].distinct(
-            'expiry', {'instrument': instrument, 'expiry': {'$gte': trade_date}},
-        ) if e
-    ])
-    _expiry_list_cache[key] = (now, expiries)
-    return expiries
+    from features.active_option_tokens_cache import get_expiries
+    return get_expiries(db, instrument)
 
 
 def _cached_token_doc(db, instrument: str, expiry: str, strike: float, option_type: str) -> dict:
-    key = (instrument, expiry, strike, option_type)
-    cached = _token_doc_cache.get(key)
-    now = time.monotonic()
-    if cached and now - cached[0] < _TOKEN_CACHE_TTL:
-        return cached[1]
-    doc = db._db['active_option_tokens'].find_one({
-        'instrument':  instrument,
-        'expiry':      expiry,
-        'strike':      strike,
-        'option_type': option_type,
-    }) or {}
-    _token_doc_cache[key] = (now, doc)
-    return doc
+    from features.active_option_tokens_cache import get_token_doc
+    return get_token_doc(db, instrument, expiry, strike, option_type)
 
 
 # ─── Helpers ──────────────────────────────────────────────────────────────────

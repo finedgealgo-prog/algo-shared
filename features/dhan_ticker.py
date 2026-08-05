@@ -135,10 +135,6 @@ def _load_dhan_spot_tokens(db) -> tuple[dict[str, str], str]:
         return _DHAN_SPOT_FALLBACK, _DHAN_VIX_FALLBACK
 
 
-_SEGMENT_CACHE_TTL = 600  # seconds — active_option_tokens (broker=dhan) is re-seeded once/day
-_segment_cache: dict[str, tuple[float, str]] = {}  # token → (cached_at, ws_segment)
-
-
 def _resolve_dhan_exchange_segments(security_ids: list[str]) -> dict[str, str]:
     """security_id → ws_segment ('NSE_FNO'/'BSE_FNO') from active_option_tokens.
 
@@ -146,42 +142,25 @@ def _resolve_dhan_exchange_segments(security_ids: list[str]) -> dict[str, str]:
     of instrument — fine for NIFTY/BANKNIFTY (genuinely NSE_FNO) but wrong for
     SENSEX/BANKEX (BSE_FNO), so those legs silently never received ticks.
 
-    Cached per token (TTL below) — resubscribes for the same handful of tokens
+    Backed by active_option_tokens_cache's whole-collection, once-a-day snapshot
+    (see that module's docstring) — resubscribes for the same handful of tokens
     fire repeatedly (every ~1s tick from live_monitor_socket's entry-trigger
     loop) while a strategy sits waiting to activate, and this collection only
     changes once/day, so re-querying Mongo for the same token every cycle was
     pure waste (see the active_option_tokens missing-index investigation this
     followed — this was one of the two hot repeat-query patterns found there).
     """
-    now = time.monotonic()
-    result: dict[str, str] = {}
-    missing: list[str] = []
-    for sid in security_ids:
-        cached = _segment_cache.get(sid)
-        if cached and now - cached[0] < _SEGMENT_CACHE_TTL:
-            result[sid] = cached[1]
-        else:
-            missing.append(sid)
-    if not missing:
-        return result
     try:
         from features.mongo_data import MongoData
+        from features.active_option_tokens_cache import get_ws_segments_bulk
         db = MongoData()
         try:
-            docs = db._db["active_option_tokens"].find(
-                {"broker": "dhan", "token": {"$in": missing}},
-                {"token": 1, "ws_segment": 1},
-            )
-            for d in docs:
-                sid = str(d.get("token"))
-                segment = str(d.get("ws_segment") or DHAN_FO_EXCHANGE)
-                result[sid] = segment
-                _segment_cache[sid] = (now, segment)
+            return get_ws_segments_bulk(db, "dhan", security_ids, DHAN_FO_EXCHANGE)
         finally:
             db.close()
     except Exception as exc:
         logger.warning("[dhan_ticker] exchange segment lookup error: %s", exc)
-    return result
+        return {}
 
 
 def ensure_stock_spot_subscribed(underlying: str) -> None:
