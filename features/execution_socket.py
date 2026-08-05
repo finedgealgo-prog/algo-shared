@@ -8127,11 +8127,21 @@ def _fetch_dhan_broker_option_positions(
             position = 'BUY'
         elif carry_forward_sell_qty > 0 and carry_forward_buy_qty <= 0:
             position = 'SELL'
-        else:
+        elif cost_price and abs(cost_price - buy_avg) < abs(cost_price - sell_avg):
             # Pure same-day round trip, no carry-forward on either side to
-            # disambiguate — Dhan's own costPrice still designates one side
-            # as "entry" here (verified: it lands on the sell side in every
-            # such case observed), so mirror that instead of guessing off qty.
+            # disambiguate. Dhan's costPrice reflects whichever side was the
+            # day's actual entry fill — it exactly matches buyAvg when the
+            # leg was opened by a buy and closed by a sell, and exactly
+            # matches sellAvg when opened by a sell and closed by a buy.
+            # Assuming it always lands on the sell side (the old behavior)
+            # fabricated entry==exit rows with a fake 0 P&L for any leg that
+            # was actually opened by a buy — e.g. costPrice=buyAvg=77.5,
+            # sellAvg=92.05, real realizedProfit=945.75, but the old code
+            # read entry=exit=77.5 and P&L=0.
+            position = 'BUY'
+        else:
+            # No costPrice signal (or it's ambiguous) — fall back to the
+            # previous default.
             position = 'SELL'
 
         if exited:
@@ -8149,12 +8159,16 @@ def _fetch_dhan_broker_option_positions(
                 entry_price = cost_price or buy_avg or _safe_float(
                     row.get('avgPrice') or row.get('averagePrice') or row.get('netPrice')
                 )
-                exit_price = sell_avg
+                exit_price = sell_avg or _safe_float(
+                    row.get('avgPrice') or row.get('averagePrice') or row.get('netPrice')
+                )
             else:
                 entry_price = cost_price or sell_avg or _safe_float(
                     row.get('avgPrice') or row.get('averagePrice') or row.get('netPrice')
                 )
-                exit_price = buy_avg
+                exit_price = buy_avg or _safe_float(
+                    row.get('avgPrice') or row.get('averagePrice') or row.get('netPrice')
+                )
         else:
             # For an OPEN carried F&O position, Dhan's app shows costPrice
             # (the MTM-settled cost basis) as the "Avg Price" — confirmed
