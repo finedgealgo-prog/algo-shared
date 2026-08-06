@@ -424,6 +424,19 @@ class _DhanTickerManager:
                 name="dhan_equity_master_prewarm",
             ).start()
 
+            # Subscribe every F&O stock's spot (NSE_EQ) token up front — see
+            # _prewarm_all_stock_spots' docstring for why spot-only, not full
+            # chains. Runs after the equity-master thread is kicked off
+            # above (same underlying CSV cache) but does its own resolve
+            # calls rather than waiting on that thread, so a slow CSV
+            # download doesn't block this from starting.
+            threading.Thread(
+                target=self._prewarm_all_stock_spots,
+                args=(db,),
+                daemon=True,
+                name="dhan_stock_spot_prewarm",
+            ).start()
+
         return {"ok": True, "message": "Dhan ticker starting"}
 
     def stop(self) -> dict:
@@ -640,6 +653,53 @@ class _DhanTickerManager:
                     print(f"[DHAN CHAIN FEED] prewarmed {underlying} expiries={len(expiries)} total_tokens={total_tokens}")
             except Exception as exc:
                 logger.warning("[DHAN CHAIN FEED] prewarm error underlying=%s: %s", underlying, exc)
+
+    def _prewarm_all_stock_spots(self, db) -> None:
+        """
+        Subscribe every F&O stock's SPOT (NSE_EQ) token at ticker startup —
+        same always-on principle as _prewarm_index_chains, but for spot
+        price only, NOT full option chains. Deliberately NOT prewarming
+        full stock option chains: ~208 stocks × full chain would be ~96k
+        contracts, ~4x Dhan's entire 25,000-token account cap (5 connections
+        × 5000) — confirmed by counting active_option_tokens directly.
+        Spot-only is ~208 extra tokens on the main connection, negligible
+        against that cap. Lets pages like the paper-trade instrument list
+        show every stock's live price from ltp_map/spot_map immediately on
+        load, with zero REST call and zero rate-gate wait per instrument.
+        """
+        try:
+            stocks = sorted({
+                str(u).strip().upper()
+                for u in db["active_option_tokens"].distinct(
+                    "instrument", {"broker": "dhan", "instrument_type": "stock"},
+                )
+                if u
+            })
+        except Exception as exc:
+            logger.warning("[DHAN STOCK SPOT PREWARM] instrument list error: %s", exc)
+            return
+        if not stocks:
+            print("[DHAN STOCK SPOT PREWARM] skipped — no stock instruments found in active_option_tokens")
+            return
+
+        try:
+            from features.execution_socket import _get_dhan_equity_sec_id
+        except Exception as exc:
+            logger.warning("[DHAN STOCK SPOT PREWARM] import error: %s", exc)
+            return
+
+        subscribed = 0
+        for underlying in stocks:
+            try:
+                if underlying in self._active_spot_tokens.values():
+                    continue
+                sec_id = _get_dhan_equity_sec_id(underlying)
+                if sec_id:
+                    self.register_spot_underlying(sec_id, underlying, exchange="NSE_EQ")
+                    subscribed += 1
+            except Exception as exc:
+                logger.warning("[DHAN STOCK SPOT PREWARM] error underlying=%s: %s", underlying, exc)
+        print(f"[DHAN STOCK SPOT PREWARM] subscribed {subscribed}/{len(stocks)} stock spot tokens")
 
     def warm_chain_tokens(self, security_ids: list[str], exchange: str = "NSE_FNO") -> None:
         """
@@ -1152,6 +1212,9 @@ class _DhanTickerManager:
             # change_pct/change_points can read a genuine prior-close without
             # a Mongo lookup; must not land in ltp_map (that's "current price").
             if feed_code == RESP_PREV_CLOSE:
+                _pc_underlying = self._active_spot_tokens.get(sid_str, "")
+                print(f"[RAW PREV_CLOSE] sid={sid_str} underlying={_pc_underlying or '-'} "
+                      f"exch_seg={_exch_seg} value={ltp_val}", flush=True)
                 self.prev_close_map[sid_str] = ltp_val
                 continue
 
@@ -1217,6 +1280,8 @@ class _DhanTickerManager:
 
             if sid_str in self._active_spot_tokens:
                 underlying = self._active_spot_tokens[sid_str]
+                print(f"[RAW SPOT TICK] sid={sid_str} underlying={underlying} "
+                      f"feed_code={feed_code} exch_seg={_exch_seg} ltp={ltp_val}", flush=True)
                 self.spot_map[underlying] = ltp_val
                 spot_ticks_received.append((underlying, ltp_val, now_ts))
 
