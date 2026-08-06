@@ -1212,9 +1212,6 @@ class _DhanTickerManager:
             # change_pct/change_points can read a genuine prior-close without
             # a Mongo lookup; must not land in ltp_map (that's "current price").
             if feed_code == RESP_PREV_CLOSE:
-                _pc_underlying = self._active_spot_tokens.get(sid_str, "")
-                print(f"[RAW PREV_CLOSE] sid={sid_str} underlying={_pc_underlying or '-'} "
-                      f"exch_seg={_exch_seg} value={ltp_val}", flush=True)
                 self.prev_close_map[sid_str] = ltp_val
                 continue
 
@@ -1280,8 +1277,6 @@ class _DhanTickerManager:
 
             if sid_str in self._active_spot_tokens:
                 underlying = self._active_spot_tokens[sid_str]
-                print(f"[RAW SPOT TICK] sid={sid_str} underlying={underlying} "
-                      f"feed_code={feed_code} exch_seg={_exch_seg} ltp={ltp_val}", flush=True)
                 self.spot_map[underlying] = ltp_val
                 spot_ticks_received.append((underlying, ltp_val, now_ts))
 
