@@ -6,11 +6,10 @@ endpoint (auth.dhan.co/app/generateAccessToken) — no OAuth consent/browser
 step needed, unlike the /broker/dhan/generate-consent flow in algo.trade's
 api.py. Requires TOTP to already be enabled on the Dhan account.
 
-client_id and the TOTP secret are read from kite_market_config's own dhan
-doc (user_id / totp fields — the same doc the OAuth consent flow already
-populates), not from env, so there's one less place to keep in sync. Only
-DHAN_PIN stays in shared/.env — Dhan's kite_market_config schema has no PIN
-field, and a login PIN is more sensitive than a TOTP seed alone.
+client_id, the TOTP secret and the PIN are all read from kite_market_config's
+own dhan doc (user_id / totp / pin fields — the same doc the OAuth consent
+flow already populates for user_id), not from env — nothing to keep in sync
+across two places.
 
 Token is valid 24h from generation, so this is meant to run once daily
 (cron hitting GET /broker/dhan/totp-login before market open, or this
@@ -24,7 +23,6 @@ it at 07:31 IST (02:01 UTC — the box runs Etc/UTC) against algo-trade on
 from __future__ import annotations
 
 import logging
-import os
 from datetime import datetime
 
 import pyotp
@@ -56,8 +54,6 @@ def refresh_dhan_token_via_totp() -> dict:
     kite_market_config (broker=dhan) — the same collection/fields the OAuth
     consent callback writes, so every existing Dhan consumer picks it up
     with no further changes."""
-    pin = os.environ.get("DHAN_PIN", "").strip()
-
     from features.mongo_data import MongoData  # type: ignore
     from features.dhan_broker_ws import save_credentials_to_db  # type: ignore
     from features.broker_gateway import reset_broker_cache  # type: ignore
@@ -69,15 +65,12 @@ def refresh_dhan_token_via_totp() -> dict:
         market_cfg = db._db["kite_market_config"].find_one({"broker": "dhan"}) or {}
         client_id = str(market_cfg.get("user_id") or market_cfg.get("dhan_client_id") or "").strip()
         secret = str(market_cfg.get("totp") or "").strip()
+        pin = str(market_cfg.get("pin") or "").strip()
         api_key = str(market_cfg.get("api_key") or "").strip()
         api_secret = str(market_cfg.get("api_secret") or "").strip()
 
-        if not client_id or not secret:
-            message = "kite_market_config (broker=dhan) is missing user_id and/or totp"
-            _notify_totp_result(db, False, message)
-            return {"ok": False, "message": message}
-        if not pin:
-            message = "DHAN_PIN must be set in shared/.env"
+        if not client_id or not secret or not pin:
+            message = "kite_market_config (broker=dhan) is missing user_id/totp/pin"
             _notify_totp_result(db, False, message)
             return {"ok": False, "message": message}
 
